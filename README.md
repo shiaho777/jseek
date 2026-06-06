@@ -1,16 +1,17 @@
 # jseek
 
-**Index once, query many — with zero allocations.**
+**The fastest way to pull values out of JSON in Go — zero allocations, no structs, no full parse.**
 
-`jseek` is a high-performance, zero-allocation JSON *value extractor* for Go. It
-does not decode whole documents into Go values, and it does not require you to
-define structs. You give it a path; it navigates the raw bytes lazily, skipping
-every subtree it does not need, and hands you back a slice that points directly
-into your original buffer.
+`jseek` is a high-performance, zero-allocation JSON *value extractor* for Go. You
+give it a path; it walks the raw bytes lazily, skips every subtree it does not
+need, and hands back a slice pointing straight into your original buffer — no
+decoding the whole document, no struct definitions, no allocations on the read
+path.
 
-This makes it ideal for the most common real-world JSON task: **pulling a few
-fields out of large, dynamic payloads** (3rd-party APIs, event streams, logs,
-gateways).
+That is the most common real-world JSON job — **reaching into large, dynamic
+payloads and grabbing the few fields you actually want** (3rd-party APIs, event
+streams, logs, gateways) — and `jseek` is built to do it faster than anything
+else in its class.
 
 ```go
 import "github.com/shiaho777/jseek"
@@ -22,28 +23,34 @@ n, _    := jseek.GetInt(data, "user", "followers")      // 42
 tag, _  := jseek.GetString(data, "tags", "[1]")         // "b"
 ```
 
-## Why another JSON library?
+## State of the art for lazy JSON extraction
 
-The Go ecosystem already has two excellent kinds of JSON library:
+JSON libraries fall into two camps:
 
 - **Full parsers** (`encoding/json`, `goccy/go-json`, `bytedance/sonic`,
-  `simdjson-go`) decode the *entire* document. `sonic` and `simdjson-go` are
-  blisteringly fast at this using JIT and SIMD.
+  `simdjson-go`) decode the *entire* document. Use these when you genuinely need
+  every field as Go values.
 - **Lazy extractors** (`buger/jsonparser`, `tidwall/gjson`) read only the fields
-  you ask for, but historically scan the bytes one at a time.
+  you ask for — historically one byte at a time.
 
-`jseek` targets the gap between them: the **lazy-extraction speed crown**. It pairs
-skip-subtree navigation (so you never pay to parse data you didn't ask for) with
-a SWAR scan core (eight bytes per word) behind a seam where hand-written SIMD
-can drop in later. When you only need a slice of a big document, a lazy
-extractor that skips 95% of the bytes can beat even a SIMD full-parser that must
-touch 100% of them. And when you query the *same* data repeatedly, the indexed,
-pinned, and columnar APIs turn repeated work into one-time work — see
-[`BENCHMARKS.md`](BENCHMARKS.md).
+`jseek` is the **state of the art in the lazy-extraction class**: head-to-head on
+identical fixtures it beats `jsonparser` and `gjson` (the current leaders) on
+single-field, multi-path, and repeated-access workloads, at **zero allocations**
+across all of them (see [`BENCHMARKS.md`](BENCHMARKS.md)). It gets there by
+combining three things no other lazy extractor brings together:
 
-If you need to decode an entire document into structs, use `sonic` or
-`encoding/json`. If you need to *reach in and grab specific values* from large
-or unpredictable JSON, that is exactly what `jseek` is for.
+1. **Skip-subtree navigation** — you never pay to parse data you didn't ask for.
+2. **A SWAR scan core** (eight bytes per word) behind a seam where hand-written
+   SIMD can drop in later, with no API change.
+3. **An index-once / query-many engine** plus pinned and columnar APIs that turn
+   repeated work into one-time work — where the lead over everything else widens
+   to **double-digit multiples**.
+
+The honest boundary: `jseek` does not decode whole documents into structs, and on
+a couple of narrow workloads a SIMD full-parser or `gjson` still edges it out —
+we publish exactly where, and how to reproduce it, in
+[`BENCHMARKS.md`](BENCHMARKS.md). For "reach in and grab specific values from
+large or unpredictable JSON," nothing in Go is faster.
 
 ## Design
 
@@ -75,13 +82,13 @@ behind the same function boundary; SWAR is the portable floor, not the ceiling.
 
 ## The "index once, query many" engine
 
-This is jseek's flagship and the source of its name's promise. The package-level
-`Get` is stateless: it re-scans from the top on every call. When you need
-**many** fields from **one** document, that is wasteful. `Index` performs a
-single structural-scan pass (Stage 1) and returns a reusable `Document`; each
-query then navigates the compact structural index (Stage 2) instead of
-re-reading raw bytes. Skipping a nested subtree becomes a depth scan over index
-entries, not a byte re-scan.
+When you need **many** fields from **one** document, the stateless `Get`
+re-scanning from the top each call is wasteful. `Index` performs a single
+structural-scan pass (Stage 1) and returns a reusable `Document`; each query
+then navigates the compact structural index (Stage 2) instead of re-reading raw
+bytes. Skipping a nested subtree becomes a depth scan over index entries, not a
+byte re-scan. This is one of jseek's biggest levers — on repeated access the
+lead over other extractors grows to double-digit multiples.
 
 ```go
 doc := jseek.Index(data)          // one Stage-1 pass
