@@ -1,5 +1,10 @@
 # jseek
 
+[![CI](https://github.com/shiaho777/jseek/actions/workflows/ci.yml/badge.svg)](https://github.com/shiaho777/jseek/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/shiaho777/jseek.svg)](https://pkg.go.dev/github.com/shiaho777/jseek)
+[![Go Report Card](https://goreportcard.com/badge/github.com/shiaho777/jseek)](https://goreportcard.com/report/github.com/shiaho777/jseek)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **The fastest way to pull values out of JSON in Go — zero allocations, no structs, no full parse.**
 
 `jseek` is a high-performance, zero-allocation JSON *value extractor* for Go. You

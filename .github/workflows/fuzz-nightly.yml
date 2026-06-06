@@ -5,10 +5,6 @@ on:
     - cron: "0 4 * * *" # daily at 04:00 UTC
   workflow_dispatch: {}
 
-defaults:
-  run:
-    working-directory: jseek
-
 jobs:
   fuzz:
     name: ${{ matrix.target }} (${{ matrix.os }})
@@ -34,7 +30,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
-          cache-dependency-path: jseek/go.mod
+          cache-dependency-path: go.mod
 
       - name: Fuzz ${{ matrix.target }}
         run: go test -run=x -fuzz=${{ matrix.target }} -fuzztime=10m ./...
@@ -44,4 +40,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-corpus-${{ matrix.target }}-${{ matrix.os }}
-          path: jseek/testdata/fuzz/${{ matrix.target }}/
+          path: testdata/fuzz/${{ matrix.target }}/
