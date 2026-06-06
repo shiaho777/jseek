@@ -1,8 +1,10 @@
-# jseek 性能基准与方法学
+# jseek benchmarks & methodology
 
-本文档完整、可复现地记录 jseek 的性能数据,**包括 jseek 落后的场景**。基准的价值在于诚实地标定边界,而不是只展示赢的数字。
+This document is a complete, reproducible record of jseek's performance —
+**including the workloads where jseek loses**. The value of a benchmark is in
+honestly marking the boundaries, not in showing only the wins.
 
-## 如何复现
+## How to reproduce
 
 ```sh
 cd bench
@@ -10,225 +12,295 @@ go test -bench=. -benchmem -count=6 | tee raw.txt
 benchstat raw.txt          # go install golang.org/x/perf/cmd/benchstat@latest
 ```
 
-所有对照库均为固定版本:`jseek` 自身通过本地 `replace => ../` 指向当前仓库源码(所以你测的就是当前代码),`jsonparser`/`gjson`/`sonic`/`simdjson-go` 为 `go.mod` 中锁定的已发布版本。
+All comparison libraries are pinned: `jseek` itself is wired via a local
+`replace => ../` to the current repository source (so you measure the code in
+front of you), while `jsonparser` / `gjson` / `sonic` / `simdjson-go` are the
+published versions locked in `bench/go.mod`.
 
-## 测试环境
+## Test environment
 
-| 项 | 值 |
+| Item | Value |
 | --- | --- |
 | CPU | Apple M4 Pro |
-| 架构 | arm64 (darwin) |
+| Arch | arm64 (darwin) |
 | Go | 1.23.4 |
-| 采样 | 每项 6 次,benchstat 汇总,波动 ±1–4% |
+| Sampling | 6 runs per case, summarized with benchstat, ±1–4% variance |
 
-不同机器绝对数字会变;请在你自己的硬件和数据上复现,看相对关系。
+Absolute numbers vary by machine; reproduce on your own hardware and data and
+look at the relative relationships.
 
-## 对照库
+## Comparison libraries
 
-- [`buger/jsonparser`](https://github.com/buger/jsonparser) —— 经典的惰性提取库
-- [`tidwall/gjson`](https://github.com/tidwall/gjson) —— 当前该领域事实上的 SOTA
+- [`buger/jsonparser`](https://github.com/buger/jsonparser) — the classic lazy
+  extractor.
+- [`tidwall/gjson`](https://github.com/tidwall/gjson) — the current de-facto SOTA
+  in this class.
 
-均为内容经改写以符合许可要求的客观第三方库,仅用于性能对照。
+These are objective third-party libraries used only for performance comparison;
+their content was rephrased for compliance with licensing restrictions.
 
-## 测试数据形态
+## Fixture shapes
 
-| fixture | 大小 | 形态 | 来源 |
+| fixture | size | shape | origin |
 | --- | --- | --- | --- |
-| small | ~190 B | 扁平的 HTTP 日志记录 | jsonparser 经典小负载 |
-| large | ~24 KB | 元数据 + 500 元素用户数组 | Discourse API 风格 |
-| github | ~60 KB | 深嵌套对象 + 200 issue 数组 | GitHub API 风格 |
-| ndjson | 5000 行 | 每行一条访问日志 | NDJSON 日志流 |
+| small | ~190 B | flat HTTP-log record | jsonparser's classic small payload |
+| large | ~24 KB | metadata + 500-element user array | Discourse-API style |
+| github | ~60 KB | deeply nested object + 200-issue array | GitHub-API style |
+| ndjson | 5000 lines | one access-log record per line | NDJSON log stream |
 
 ---
 
-## 结果一:单字段 / 少量字段读取
+## Result 1: single-field / few-field reads
 
-每次操作都从头扫描(无状态),典型的"从一份数据里取几个字段"。
+Every operation scans from the top (stateless) — the typical "grab a few fields
+from one document."
 
-| 场景 | jseek | jsonparser | gjson |
+| Scenario | jseek | jsonparser | gjson |
 | --- | --- | --- | --- |
-| 小负载,4 字段 | **145 ns** / 0 B | 276 ns / 0 B | 349 ns / 144 B |
-| 大文档,浅层字段 | **106 ns** / 0 B | 116 ns / 0 B | 158 ns / 16 B |
-| 大文档,深层带下标字段 | **70 µs** / 0 B | 238 µs / 0 B | 88 µs / 16 B |
-| 大文档,完整 ArrayEach | **131 µs** / 0 B | 211 µs / 0 B | 289 µs / 184 KB |
+| Small payload, 4 fields | **145 ns** / 0 B | 276 ns / 0 B | 349 ns / 144 B |
+| Large doc, shallow fields | **106 ns** / 0 B | 116 ns / 0 B | 158 ns / 16 B |
+| Large doc, deep indexed field | **70 µs** / 0 B | 238 µs / 0 B | 88 µs / 16 B |
+| Large doc, full ArrayEach | **131 µs** / 0 B | 211 µs / 0 B | 289 µs / 184 KB |
 
-**结论:** 单次提取上 jseek 全面领先,且是唯一全程零分配的库。
+**Takeaway:** jseek leads across single extractions and is the only
+zero-allocation library throughout. (But see Result 8 — against a SIMD
+full-parser, the deep-indexed cold case does *not* hold.)
 
 ---
 
-## 结果二:多路径(单遍)
+## Result 2: multi-path (single pass)
 
-一次读多个字段。
+Reading several fields at once.
 
-| 引擎 | 时间 | 分配 |
+| Engine | time | allocs |
 | --- | --- | --- |
-| jseek `EachKey`(无状态,单遍) | **148 µs** | 0 B |
-| jseek 逐个 `Get` ×N | 163 µs | 0 B |
+| jseek `EachKey` (stateless, single pass) | **148 µs** | 0 B |
+| jseek N× `Get` | 163 µs | 0 B |
 | gjson `GetManyBytes` | 194 µs | 536 B |
 
-**结论:** jseek 单遍多路径最快且零分配。
+**Takeaway:** jseek's single-pass multi-path is fastest and zero-allocation.
 
 ---
 
-## 结果三:索引一次,查询多次(旗舰场景)
+## Result 3: index once, query many (flagship scenario)
 
-从一份 24 KB 文档读 12 个分散字段。
+Reading 12 scattered fields from one 24 KB document.
 
-| 方式 | 时间 | 分配 |
+| Approach | time | allocs |
 | --- | --- | --- |
-| 无状态 `Get` ×12(每次重扫) | 380 µs | 0 B |
-| `IndexPooled` + 12 次查询 | 194 µs | ~34 B |
-| **复用索引,12 次查询** | **120 µs** | 0 B |
+| Stateless `Get` ×12 (re-scan each) | 380 µs | 0 B |
+| `IndexPooled` + 12 queries | 194 µs | ~34 B |
+| **Reused index, 12 queries** | **120 µs** | 0 B |
 | gjson `GetManyBytes` | 460 µs | 1.16 KB |
 
-**结论:** 索引复用时 jseek 比 gjson 快约 3.8 倍,零分配。字段越多优势越大。
+**Takeaway:** with a reused index jseek is ~3.8x faster than gjson, zero
+allocations. The more fields you read, the larger the win.
 
 ---
 
-## 结果四:跳转 tape(O(1) 子树跳过)
+## Result 4: skip tape (O(1) subtree skipping)
 
-同一份大文档上,线性跳过 vs tape 跳过(对照 A/B,同二进制)。
+On the same large document, linear skip vs tape skip (A/B, same binary).
 
-| 场景 | 线性 | tape | 加速 |
+| Scenario | linear | tape | speedup |
 | --- | --- | --- | --- |
-| 12 个分散字段(reused) | 121 µs | **5.8 µs** | ~21x |
-| 深层 `users[499].name` | 23.2 µs | **1.57 µs** | ~15x |
-| 多路径 `EachDoc` | 47.7 µs(无 tape) | **2.26 µs**(tape) | ~21x |
-| 多路径 `Each`(无状态对照) | 148 µs | — | — |
+| 12 scattered fields (reused) | 121 µs | **5.8 µs** | ~21x |
+| deep `users[499].name` | 23.2 µs | **1.57 µs** | ~15x |
+| multi-path `EachDoc` | 47.7 µs (no tape) | **2.26 µs** (tape) | ~21x |
+| multi-path `Each` (stateless baseline) | 148 µs | — | — |
 
-**结论:** tape 把 O(子树) 的跳过变成 O(1),在深层/分散访问上是数量级的提升,且查询仍零分配。代价是索引期多一个 `uint32`/结构字符的临时内存,随 `Document` 释放。
+**Takeaway:** the tape turns O(subtree) skipping into O(1) — an order-of-magnitude
+gain on deep/scattered access, queries still zero-allocation. The cost is one
+extra `uint32` per structural in the transient index, released with the
+`Document`.
 
 ---
 
-## 结果五:真实世界 —— GitHub 风格嵌套响应
+## Result 5: real-world — GitHub-style nested response
 
-200 issue,取 7 个分散字段。
+200 issues, reading 7 scattered fields.
 
-| 方式 | 时间 | 分配 |
+| Approach | time | allocs |
 | --- | --- | --- |
-| jseek IndexTape(复用) | **1.47 µs** | 0 B |
-| jseek 无状态 | 56.5 µs | 0 B |
-| jseek 每请求(池化) | 59.1 µs | ~11 B |
+| jseek IndexTape (reused) | **1.47 µs** | 0 B |
+| jseek stateless | 56.5 µs | 0 B |
+| jseek per-request (pooled) | 59.1 µs | ~11 B |
 | gjson GetMany | 56.0 µs | 664 B |
 | jsonparser | 156 µs | 0 B |
 
-**结论:** 索引复用时碾压(比 gjson 快约 38x)。每请求场景与 gjson 时间相当,但近乎零分配。
+**Takeaway:** with a reused index jseek dominates (~38x faster than gjson). The
+per-request case is on par with gjson on time but near-zero allocation.
 
 ---
 
-## 结果六:真实世界 —— NDJSON 日志流(jseek 的短板,如实记录)
+## Result 6: real-world — NDJSON log stream (jseek's weak spot, recorded honestly)
 
-5000 条 ~250 B 的扁平记录,全部在内存中,每条逐字段读 3 个字段。
+5000 flat ~250 B records, all in memory, reading 3 fields per record
+field-by-field.
 
-| 方式 | 时间 | 分配 |
+| Approach | time | allocs |
 | --- | --- | --- |
-| gjson(按行 Get) | **1.81 ms** | 0 B |
-| jseek `StreamBytes` + 单遍 `EachKey` | 1.94 ms | 0 B |
+| gjson (per-line Get) | **1.81 ms** | 0 B |
+| jseek `StreamBytes` + single-pass `EachKey` | 1.94 ms | 0 B |
 | jseek `StreamBytes` + 3× `Get` | 2.23 ms | 0 B |
-| jseek `Decoder`(reader 流式) | 2.35 ms | 64 KB(一次性缓冲) |
+| jseek `Decoder` (reader streaming) | 2.35 ms | 64 KB (one-time buffer) |
 
-**诚实结论:** 在这个特定形态(小记录、全内存、逐字段)上,**gjson 比 jseek 快约 7.5%**。原因:对约 250 B 的扁平记录,gjson 高度特化的小标量扫描更紧凑,而 jseek 的结构化导航/索引开销在这个尺寸下摊不平。
+**Honest takeaway:** on this specific shape (small records, fully in memory,
+field-by-field), **gjson is ~7.5% faster than jseek**. The reason: for ~250 B
+flat records, gjson's highly specialized small-scalar scan is more compact,
+while jseek's structural-navigation/index overhead does not amortize at this
+size.
 
-**何时仍该用 jseek 的流式:** 当数据**放不进内存**时——`Decoder` 的内存占用由最大单元素决定,而不是整个流;gjson 那种"全切片在内存里"的做法此时不可行。这是 jseek 流式的真正价值点,而本基准(全内存)不奖励它。
-
----
-
-## 结果七:重复访问 —— 钉住查询与列式转置(最大的杠杆)
-
-前六组都是"冷"或"单遍"访问。但真实系统里,数据常被**反复访问**:热配置被查百万次,一批日志被聚合几十个指标。这时真正的杠杆不是"扫描更快",而是**消除重复扫描/重复导航**。
-
-### Pin:重复查询同一份数据(24 KB 配置,3 个字段)
-
-| 方式 | 每次查询 | 相对冷扫描 |
-| --- | --- | --- |
-| 冷 `Get`(gjson/jsonparser 被迫如此) | 239 ns | 1x |
-| 索引复用 `Document.Get` | 147 ns | 1.6x |
-| **`Pin`(学一次轨迹,验证后直接取址)** | **66 ns** | **3.6x** |
-
-Pin 比白盒原型(17 ns)慢,是因为正式版做了**全路径键链验证**——这是"永不返回错误值"的代价,我如实标注。
-
-### Transpose:重复聚合同一批(5000 条日志)
-
-| 聚合次数 | 行式 `Get` | 列式 `Transpose` | 倍数 |
-| --- | --- | --- | --- |
-| 50 次 | 16.0 ms | **524 µs** | **~30x** |
-| 200 次 | 80.8 ms | 866 µs | **~93x** |
-
-**倍数随聚合次数无上界增长**,因为转置成本固定(一次),之后每次聚合是纯原生切片扫描,趋近零。gjson 在同一行式工作负载上是 16.5 ms,同样被列式甩开。
-
-### 这意味着什么(以及它的边界)
-
-- **"几十到上百倍"在重复访问场景下是真实的**,有基准、有正确性模糊测试(1750 万次执行零错误)撑腰。
-- **它不违反任何物理定律**:列式把"N 次重复 JSON 导航"变成"1 次导航 + N 次裸切片扫描"。收益来自**消除重复**,不是"比读取字节还快地解析"。
-- **边界**:单次冷查询(数据只看一次)依然受信息论下界约束——那里没有数量级提升,前六组结果已诚实标定。重复访问越多,列式优势越大;只看一次,就退化为普通的一次解析。
-
-| 维度 | 结论 |
-| --- | --- |
-| 单次提取(小/大) | jseek 领先,零分配 |
-| 多路径单遍 | jseek 领先,零分配 |
-| 索引复用 / 深层访问 | jseek 数量级领先(tape) |
-| 嵌套 API 响应 | jseek 复用时碾压,每请求持平且更省内存 |
-| 小记录全内存逐字段流式 | **gjson 略快(约 7.5%)** |
-| **重复查询同一数据(Pin)** | **jseek 快 3.6x,无人提供** |
-| **重复聚合同一批(列式 Transpose)** | **jseek 快 30–93x 且随次数无上界增长** |
-
-jseek 在惰性提取、索引复用、多字段、深层导航上是该领域最快;在"小记录全内存逐字段"这一窄场景上略逊于 gjson,且差距已被收敛到个位数百分比。
+**When jseek's streaming still wins:** when the data does **not** fit in memory —
+`Decoder`'s memory is bounded by the largest single element, not the whole
+stream, whereas gjson's "whole slice in memory" approach is not viable there.
+That is the real value of jseek's streaming, and this (in-memory) benchmark does
+not reward it.
 
 ---
 
-## 结果八:对照全量解析 SOTA —— sonic 与 simdjson-go(诚实标定)
+## Result 7: repeated access — pinned queries & columnar transpose (the biggest lever)
 
-前面只跟惰性提取库(jsonparser、gjson)比。要谈"超越 SOTA",必须把全量解析阵营的两强拉进来:
+Results 1–6 are "cold" or "single-pass" access. But in real systems data is
+often accessed **repeatedly**: a hot config queried a million times, a batch of
+logs aggregated over dozens of metrics. The real lever there is not "scan
+faster" but **eliminating repeated scanning/navigation**.
 
-- **[`bytedance/sonic`](https://github.com/bytedance/sonic)** —— JIT 加速,且提供惰性 `Get(path...)` API。
-- **[`minio/simdjson-go`](https://github.com/minio/simdjson-go)** —— SIMD 全量解析,Parse 后导航 tape。
+### Pin: repeatedly querying the same data (24 KB config, 3 fields)
 
-### 必须先讲清楚的架构事实(否则数字会误导)
-
-| 库 | amd64 | arm64(本测试机 M4 Pro) |
+| Approach | per query | vs cold scan |
 | --- | --- | --- |
-| simdjson-go | 需要 AVX2/SSE,正常运行 | **`SupportedCPU()=false`,根本无法运行** |
-| sonic | JIT 快路径 | **回退到兼容路径,非真实速度** |
+| Cold `Get` (what gjson/jsonparser force) | 239 ns | 1x |
+| Reused-index `Document.Get` | 147 ns | 1.6x |
+| **`Pin` (learn the trajectory once, verify then direct-address)** | **66 ns** | **3.6x** |
 
-也就是说:**本机(arm64)测不出 sonic / simdjson 的真实快路径。** 下表的 sonic 数字是它的**下限**(回退路径,纯 Go 的手写跳扫);到了 amd64,sonic 只会更快。真实对照必须在 amd64 Linux 上跑(已接入对照基准,待 CI 的 amd64 job 产出)。simdjson 行在 arm64 自动 `b.Skip`。
+Pin is slower than a white-box prototype (17 ns) because the production version
+does **full key-chain verification** — that is the cost of "never returns a wrong
+value," and I mark it honestly.
 
-对照库均为客观第三方库,内容经改写以符合许可要求,仅用于性能对照。
+### Transpose: repeatedly aggregating the same batch (5000 logs)
 
-### 冷访问 / 单遍(同样的工作量,比谁扫得快)
-
-| 场景 | jseek(无状态) | sonic(arm64 下限) | 关系 |
+| Aggregation passes | row-wise `Get` | columnar `Transpose` | factor |
 | --- | --- | --- | --- |
-| 小负载,4 字段 | **165 ns** / 0 B | 800 ns / 284 B | **jseek 快 ~5x** |
-| 大文档,浅层 2 字段 | **122 ns** / 0 B | 385 ns / 81 B | **jseek 快 ~3x** |
-| 大文档,深层下标 2 字段 | 73 µs / 0 B | **22 µs** / 88 B | **sonic 快 3.3x** |
-| 12 个分散字段 | 373 µs / 0 B | **109 µs** / 564 B | **sonic 快 3.4x** |
-| GitHub 7 个嵌套字段 | 56 µs / 0 B | **15.5 µs** / 329 B | **sonic 快 3.6x** |
+| 50 passes | 16.0 ms | **524 µs** | **~30x** |
+| 200 passes | 80.8 ms | 866 µs | **~93x** |
 
-**诚实结论:** 冷访问上 jseek 在**小/浅**负载领先(且零分配),但在**深层数组下标 / 大量分散字段**上**输给 sonic 约 3.3–3.6x**。根因经 profile 确认:这类场景的成本由"扫过被跳过元素的字符串体"主导,这是信息论地板(要读到目标就得读过沿途字节)叠加常数因子;sonic 的扫描常数因子更优。这是真实的、不掩饰的短板,且 sonic 在 amd64 上差距只会更大。
+**The factor grows without bound as passes increase**, because the transpose
+cost is fixed (once) and every subsequent aggregation is a plain native-slice
+scan, approaching zero. gjson is 16.5 ms on the same row-wise workload — also
+left behind by the columnar approach.
 
-> 注:此前文档中"单次提取上 jseek 全面领先"的说法,在仅对照 gjson/jsonparser 时成立;**纳入 sonic 后,深层/分散的冷访问并不成立**,故在此修正。基准是用来标定边界的,不是用来营销的。
+### What this means (and its boundary)
 
-### 摊销访问(index 一次,tape 复用,query 多次)——jseek 的真正碾压区
+- **"Tens to hundreds of times" is real in repeated-access scenarios**, backed by
+  benchmarks and correctness fuzzing (17.5M executions, zero divergences).
+- **It violates no law of physics**: columnar turns "N repeated JSON navigations"
+  into "1 navigation + N raw-slice scans." The win comes from eliminating
+  repetition, not from parsing faster than reading the bytes.
+- **Boundary**: a single cold query (data seen once) is still bound by the
+  information-theoretic floor — no order-of-magnitude gain there, as Results 1–6
+  honestly establish. The more repeated the access, the larger the columnar win;
+  seen once, it degrades to a normal single parse.
 
-| 场景 | jseek(IndexTape 复用) | sonic(冷,被迫每次重扫) | jseek 优势 |
-| --- | --- | --- | --- |
-| 12 个分散字段 | **5.9 µs** / 0 B | 109 µs | **~18x** |
-| GitHub 7 个嵌套字段 | **1.5 µs** / 0 B | 15.5 µs | **~10x** |
-| 多路径 `EachDoc` + tape(6 路径) | **2.6 µs** / 0 B | 109 µs | **~42x** |
-
-**结论:** 一旦命中"index once, query many"前提,jseek 用 tape 复用对 sonic 是 **10–42x 的数量级碾压,且全程零分配**。这正是 jseek 设计的主场——把 sonic 每次被迫的全文重扫,变成一次结构索引 + O(1) 子树跳过的多次导航。
-
-### 这一组的总账
-
-| 维度 | vs sonic |
+| Dimension | Verdict |
 | --- | --- |
-| 小 / 浅冷访问 | jseek 领先,零分配 |
-| 深层 / 大量分散冷访问 | **sonic 领先 ~3.3x(jseek 的真实短板)** |
-| index+tape 复用 | **jseek 数量级碾压(10–42x),零分配** |
-| simdjson 对照 | 待 amd64 CI 产出(arm64 无法运行) |
+| Single extraction (small/large) | jseek leads, zero alloc |
+| Multi-path single pass | jseek leads, zero alloc |
+| Index reuse / deep access | jseek leads by orders of magnitude (tape) |
+| Nested API response | jseek dominates when reused, on par + leaner per-request |
+| Small-record in-memory field-by-field stream | **gjson slightly faster (~7.5%)** |
+| **Repeated queries on same data (Pin)** | **jseek 3.6x faster, no peer offers it** |
+| **Repeated aggregation on same batch (columnar Transpose)** | **jseek 30–93x faster, growing without bound** |
 
-一句话:**jseek 在"重复/多字段/索引复用"上碾压全量解析 SOTA,在"单次冷取深层字段"上仍落后 sonic——后者是信息论边界附近的常数因子之争,如实记录,不偷换概念。**
+jseek is fastest in this class for lazy extraction, index reuse, multi-field, and
+deep navigation; it trails gjson slightly on the narrow "small-record in-memory
+field-by-field" shape, and that gap is held to single-digit percent.
 
-## 关于数字的纪律
+---
 
-本仓库所有性能改动都遵循同一流程:**先 profile 定位真实热点 → 针对性优化 → 同二进制对照 A/B + benchstat 证明 → 差分模糊测试守正确性。** 任何"提速"若被基准噪声淹没,一律不计入。这正是为什么这里同时记录了 jseek 赢和输的场景——基准是用来标定边界的,不是用来营销的。
+## Result 8: vs the full-parsing SOTA — sonic & simdjson-go (honest calibration)
+
+The sections above compare only against lazy extractors (jsonparser, gjson). To
+talk about "beating the SOTA," the two strongest full-parsing libraries have to
+be in the picture:
+
+- **[`bytedance/sonic`](https://github.com/bytedance/sonic)** — JIT-accelerated,
+  and offers a lazy `Get(path...)` API.
+- **[`minio/simdjson-go`](https://github.com/minio/simdjson-go)** — SIMD full
+  parse, then navigate the tape.
+
+### An architectural fact that must be stated first (or the numbers mislead)
+
+| Library | amd64 | arm64 (this test machine, M4 Pro) |
+| --- | --- | --- |
+| simdjson-go | needs AVX2/SSE, runs normally | **`SupportedCPU()=false`, cannot run at all** |
+| sonic | JIT fast path | **falls back to the compat path, not its real speed** |
+
+In other words: **this machine (arm64) cannot measure sonic / simdjson's real
+fast path.** The sonic numbers below are its **lower bound** (fallback path, a
+pure-Go hand-written skip scan); on amd64 sonic would only be faster. A true
+comparison must run on amd64 Linux (the comparison benchmark is wired in,
+pending output from the amd64 CI job). The simdjson rows `b.Skip` on arm64.
+
+The comparison libraries are objective third-party libraries; their content was
+rephrased for compliance with licensing restrictions, used only for performance
+comparison.
+
+### Cold access / single pass (same work — who scans faster)
+
+| Scenario | jseek (stateless) | sonic (arm64 lower bound) | relation |
+| --- | --- | --- | --- |
+| Small payload, 4 fields | **165 ns** / 0 B | 800 ns / 284 B | **jseek ~5x faster** |
+| Large doc, shallow 2 fields | **122 ns** / 0 B | 385 ns / 81 B | **jseek ~3x faster** |
+| Large doc, deep indexed 2 fields | 73 µs / 0 B | **22 µs** / 88 B | **sonic 3.3x faster** |
+| 12 scattered fields | 373 µs / 0 B | **109 µs** / 564 B | **sonic 3.4x faster** |
+| GitHub 7 nested fields | 56 µs / 0 B | **15.5 µs** / 329 B | **sonic 3.6x faster** |
+
+**Honest takeaway:** on cold access jseek leads on **small/shallow** payloads
+(and zero allocation), but on **deep array indices / many scattered fields** it
+**loses to sonic by ~3.3–3.6x**. Profiling confirms the root cause: the cost of
+those scenarios is dominated by scanning the string bodies of skipped elements —
+an information-theoretic floor (you must read the bytes along the way to reach
+the target) times a constant factor, and sonic's scan constant factor is better.
+This is a real, undisguised weak spot, and on amd64 sonic's lead only widens.
+
+> Note: the earlier claim that "jseek leads across all single extractions" holds
+> only when comparing against gjson/jsonparser; **once sonic is included it does
+> not hold for deep/scattered cold access**, so it is corrected here. Benchmarks
+> are for calibrating boundaries, not for marketing.
+
+### Amortized access (index once, reuse the tape, query many) — jseek's true blowout zone
+
+| Scenario | jseek (IndexTape reused) | sonic (cold, forced to re-scan each time) | jseek advantage |
+| --- | --- | --- | --- |
+| 12 scattered fields | **5.9 µs** / 0 B | 109 µs | **~18x** |
+| GitHub 7 nested fields | **1.5 µs** / 0 B | 15.5 µs | **~10x** |
+| multi-path `EachDoc` + tape (6 paths) | **2.6 µs** / 0 B | 109 µs | **~42x** |
+
+**Takeaway:** once the "index once, query many" premise holds, jseek with a
+reused tape is an order-of-magnitude **10–42x blowout over sonic, zero allocation
+throughout**. This is exactly jseek's home turf — it turns sonic's forced
+full-document re-scan on every call into one structural index plus O(1)
+subtree-skipping navigation, many times over.
+
+### The bottom line for this section
+
+| Dimension | vs sonic |
+| --- | --- |
+| Small / shallow cold access | jseek leads, zero alloc |
+| Deep / many scattered cold access | **sonic leads ~3.3x (jseek's real weak spot)** |
+| index+tape reuse | **jseek dominates by orders of magnitude (10–42x), zero alloc** |
+| simdjson comparison | pending amd64 CI output (cannot run on arm64) |
+
+In one sentence: **jseek dominates the full-parsing SOTA on "repeated /
+multi-field / index-reuse," and still trails sonic on "single cold read of a
+deep field" — the latter is a constant-factor contest near the
+information-theoretic boundary, recorded honestly, no goalpost-moving.**
+
+## Discipline about the numbers
+
+Every performance change in this repo follows the same process: **profile to find
+the real hotspot → optimize for it → prove with a same-binary A/B + benchstat →
+guard correctness with differential fuzzing.** Any "speedup" drowned by benchmark
+noise does not count. That is exactly why both jseek's wins and losses are
+recorded here — benchmarks are for calibrating boundaries, not for marketing.
