@@ -8,7 +8,7 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/tidwall/gjson"
-	"github.com/shiahonb777/jseek"
+	"github.com/shiaho777/jseek"
 )
 
 // This file validates the synthetic-fixture wins on JSON shaped like real APIs:

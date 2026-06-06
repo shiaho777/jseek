@@ -3,7 +3,7 @@ package bench
 import (
 	"testing"
 
-	"github.com/shiahonb777/jseek"
+	"github.com/shiaho777/jseek"
 )
 
 func BenchmarkTransposeBuildOnly(b *testing.B) {

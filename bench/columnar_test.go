@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/tidwall/gjson"
-	"github.com/shiahonb777/jseek"
+	"github.com/shiaho777/jseek"
 )
 
 // Columnar vs row-wise repeated analytics over a homogeneous batch. This is the

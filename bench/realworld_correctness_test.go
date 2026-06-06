@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shiahonb777/jseek"
+	"github.com/shiaho777/jseek"
 )
 
 // Validate that the generated fixtures are valid JSON and that jseek extracts the

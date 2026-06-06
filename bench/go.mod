@@ -1,4 +1,4 @@
-module github.com/shiahonb777/jseek/bench
+module github.com/shiaho777/jseek/bench
 
 go 1.23
 
@@ -7,7 +7,7 @@ require (
 	github.com/bytedance/sonic v1.15.2
 	github.com/minio/simdjson-go v0.4.5
 	github.com/tidwall/gjson v1.17.3
-	github.com/shiahonb777/jseek v0.0.0
+	github.com/shiaho777/jseek v0.0.0
 )
 
 require (
@@ -23,6 +23,6 @@ require (
 	golang.org/x/sys v0.22.0 // indirect
 )
 
-replace github.com/shiahonb777/jseek => ../
+replace github.com/shiaho777/jseek => ../
 
 replace github.com/buger/jsonparser => ../../

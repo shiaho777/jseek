@@ -13,7 +13,7 @@ fields out of large, dynamic payloads** (3rd-party APIs, event streams, logs,
 gateways).
 
 ```go
-import "github.com/shiahonb777/jseek"
+import "github.com/shiaho777/jseek"
 
 data := []byte(`{"user":{"name":"Ada","followers":42},"tags":["a","b"]}`)
 

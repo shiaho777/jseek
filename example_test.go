@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/shiahonb777/jseek"
+	"github.com/shiaho777/jseek"
 )
 
 func ExampleGet() {
