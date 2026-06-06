@@ -10,7 +10,7 @@ go test -bench=. -benchmem -count=6 | tee raw.txt
 benchstat raw.txt          # go install golang.org/x/perf/cmd/benchstat@latest
 ```
 
-所有对照库通过本地 `replace` 指向磁盘上的源码,所以你测的就是当前代码。
+所有对照库均为固定版本:`jseek` 自身通过本地 `replace => ../` 指向当前仓库源码(所以你测的就是当前代码),`jsonparser`/`gjson`/`sonic`/`simdjson-go` 为 `go.mod` 中锁定的已发布版本。
 
 ## 测试环境
 
