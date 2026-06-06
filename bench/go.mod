@@ -3,11 +3,11 @@ module github.com/shiaho777/jseek/bench
 go 1.23
 
 require (
-	github.com/buger/jsonparser v0.0.0
+	github.com/buger/jsonparser v1.1.1
 	github.com/bytedance/sonic v1.15.2
 	github.com/minio/simdjson-go v0.4.5
-	github.com/tidwall/gjson v1.17.3
 	github.com/shiaho777/jseek v0.0.0
+	github.com/tidwall/gjson v1.17.3
 )
 
 require (
@@ -24,5 +24,3 @@ require (
 )
 
 replace github.com/shiaho777/jseek => ../
-
-replace github.com/buger/jsonparser => ../../
