@@ -5,13 +5,11 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/shiaho777/jseek)](https://goreportcard.com/report/github.com/shiaho777/jseek)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**The fastest way to pull values out of JSON in Go — zero allocations, no structs, no full parse.**
-
-`jseek` is a high-performance, zero-allocation JSON *value extractor* for Go. You
+**`jseek` is a high-performance, zero-allocation JSON *value extractor* for Go. You
 give it a path; it walks the raw bytes lazily, skips every subtree it does not
 need, and hands back a slice pointing straight into your original buffer — no
 decoding the whole document, no struct definitions, no allocations on the read
-path.
+path.**
 
 That is the most common real-world JSON job — **reaching into large, dynamic
 payloads and grabbing the few fields you actually want** (3rd-party APIs, event
