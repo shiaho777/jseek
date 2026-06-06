@@ -1,0 +1,108 @@
+name: jseek CI
+
+on:
+  push:
+    paths:
+      - "jseek/**"
+  pull_request:
+    paths:
+      - "jseek/**"
+
+defaults:
+  run:
+    working-directory: jseek
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest is amd64; macos-14 is Apple Silicon (arm64). Together
+        # they gate every change on both architectures jseek targets — the
+        # prerequisite for landing hand-written AVX2/AVX-512 (amd64) and NEON
+        # (arm64) kernels safely.
+        os: [ubuntu-latest, macos-14]
+        go: ["1.23.x"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: jseek/go.mod
+
+      - name: Report architecture
+        run: go env GOARCH GOOS
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (default build)
+        run: go test -count=1 ./...
+
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Test (jseeksafe build, no unsafe)
+        run: go test -tags jseeksafe -count=1 ./...
+
+      - name: Test (purego build, no SIMD dispatch)
+        run: go test -tags purego -count=1 ./...
+
+  fuzz-smoke:
+    name: fuzz smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache-dependency-path: jseek/go.mod
+
+      # Run each fuzz target briefly to exercise the corpus and catch
+      # regressions on both architectures. Longer campaigns run on a schedule.
+      - name: Fuzz Get vs stdlib
+        run: go test -run=x -fuzz=FuzzGetAgainstStdlib -fuzztime=20s ./...
+      - name: Fuzz Document vs Get
+        run: go test -run=x -fuzz=FuzzDocumentMatchesGet -fuzztime=20s ./...
+      - name: Fuzz Tape vs Get
+        run: go test -run=x -fuzz=FuzzTapeMatchesGet -fuzztime=20s ./...
+      - name: Fuzz EachKey vs Get
+        run: go test -run=x -fuzz=FuzzEachKeyMatchesGet -fuzztime=20s ./...
+      - name: Fuzz EachDoc vs EachKey
+        run: go test -run=x -fuzz=FuzzEachDocMatchesEachKey -fuzztime=20s ./...
+      - name: Fuzz Set vs stdlib
+        run: go test -run=x -fuzz=FuzzSetAgainstStdlib -fuzztime=20s ./...
+      - name: Fuzz Delete vs stdlib
+        run: go test -run=x -fuzz=FuzzDeleteAgainstStdlib -fuzztime=20s ./...
+      - name: Fuzz Stream vs ArrayEach
+        run: go test -run=x -fuzz=FuzzStreamMatchesArrayEach -fuzztime=20s ./...
+      - name: Fuzz StreamBytes vs Decoder
+        run: go test -run=x -fuzz=FuzzStreamBytesMatchesDecoder -fuzztime=20s ./...
+      - name: Fuzz Pin vs Get
+        run: go test -run=x -fuzz=FuzzPinMatchesGet -fuzztime=20s ./...
+      - name: Fuzz Transpose vs Get
+        run: go test -run=x -fuzz=FuzzTransposeMatchesGet -fuzztime=20s ./...
+
+  bench:
+    name: benchmark (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache-dependency-path: jseek/bench/go.sum
+      - name: Run benchmarks
+        working-directory: jseek/bench
+        run: go test -bench=. -benchmem -benchtime=1x ./...

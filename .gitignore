@@ -1,0 +1,13 @@
+# Compiled test/benchmark binaries
+*.test
+
+# Profiling output
+*.out
+*.prof
+*.pprof
+cpu.out
+mem.out
+
+# Editor / OS cruft
+.DS_Store
+*.swp
