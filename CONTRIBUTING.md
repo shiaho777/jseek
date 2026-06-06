@@ -14,7 +14,7 @@ propose changes while preserving the project's core guarantees.
 jseek is a single Go package at the module root. The `bench/` subdirectory is a
 separate module so benchmark-only dependencies never leak into consumers.
 
-Read `ARCHITECTURE.md` first — it explains the layers and the invariants you
+Read `docs/ARCHITECTURE.md` first — it explains the layers and the invariants you
 must not break.
 
 ## Development loop
@@ -34,13 +34,13 @@ cd bench
 go test -bench=. -benchmem
 ```
 
-See [`BENCHMARKS.md`](BENCHMARKS.md) for the full results, methodology, and the
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full results, methodology, and the
 honest record of where `jseek` wins and loses. When a change affects performance,
 update those numbers and include before/after benchstat output in your PR.
 
 ## The five invariants
 
-Every change must preserve these (see `ARCHITECTURE.md` for detail):
+Every change must preserve these (see `docs/ARCHITECTURE.md` for detail):
 
 1. The read path allocates nothing beyond documented exceptions.
 2. Input bytes are never mutated.
@@ -56,7 +56,7 @@ Every change must preserve these (see `ARCHITECTURE.md` for detail):
 3. Add a runnable `Example` in `example_test.go` if it is part of the public API.
 4. If it touches a hot path, add or update a benchmark and include before/after
    numbers in your PR.
-5. Update `README.md` and, if structural, `ARCHITECTURE.md`.
+5. Update `README.md` and, if structural, `docs/ARCHITECTURE.md`.
 
 ## Running fuzz tests
 

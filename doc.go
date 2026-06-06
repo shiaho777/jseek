@@ -25,7 +25,7 @@
 // index so each query navigates a compact index instead of re-scanning bytes;
 // IndexTape adds O(1) subtree skipping for deep access. Pin caches a path's
 // learned trajectory for near-direct-address repeat reads. These are the basis
-// of jseek's largest speedups (see BENCHMARKS.md).
+// of jseek's largest speedups (see docs/BENCHMARKS.md).
 //
 // # Columnar analytics
 //

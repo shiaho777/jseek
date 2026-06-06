@@ -41,7 +41,7 @@ JSON libraries fall into two camps:
 `jseek` is the **state of the art in the lazy-extraction class**: head-to-head on
 identical fixtures it beats `jsonparser` and `gjson` (the current leaders) on
 single-field, multi-path, and repeated-access workloads, at **zero allocations**
-across all of them (see [`BENCHMARKS.md`](BENCHMARKS.md)). It gets there by
+across all of them (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). It gets there by
 combining three things no other lazy extractor brings together:
 
 1. **Skip-subtree navigation** — you never pay to parse data you didn't ask for.
@@ -54,7 +54,7 @@ combining three things no other lazy extractor brings together:
 The honest boundary: `jseek` does not decode whole documents into structs, and on
 a couple of narrow workloads a SIMD full-parser or `gjson` still edges it out —
 we publish exactly where, and how to reproduce it, in
-[`BENCHMARKS.md`](BENCHMARKS.md). For "reach in and grab specific values from
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). For "reach in and grab specific values from
 large or unpredictable JSON," nothing in Go is faster.
 
 ## Design
@@ -477,9 +477,9 @@ arm64. The public API is considered stable.
 The byte scanner uses SWAR today; hand-written AVX2/AVX-512 and NEON kernels are
 an optional future increment behind the existing scan seam — measured to be
 worth single-digit percent here, so they are not a prerequisite (see
-[`BENCHMARKS.md`](BENCHMARKS.md)).
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)).
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 [`CONTRIBUTING.md`](CONTRIBUTING.md) to get involved.
 
 ## Benchmarks
@@ -510,6 +510,6 @@ Representative results on an Apple M4 Pro (lower is better):
 `jseek` leads on single-field, multi-path, and (especially) indexed/reused access,
 and is zero-allocation across all of them. **It is not universally fastest:** on
 tiny in-memory NDJSON records read field-by-field, `gjson` is ~7.5% faster — see
-[`BENCHMARKS.md`](BENCHMARKS.md) for the full results including where `jseek`
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full results including where `jseek`
 loses, the methodology, and how to reproduce. Numbers vary by machine and
 payload; verify on your own hardware and data.
