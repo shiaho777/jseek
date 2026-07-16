@@ -102,16 +102,23 @@ func (d *Document) findKeyIndexed(si int, key string) (valByteStart int, valStru
 // structurals[si].
 func (d *Document) findIndexIndexed(si int, n int) (valByteStart int, valStruct int, found bool) {
 	s := d.structurals
-	j := si + 1
-	if j >= len(s) {
+	if si+1 >= len(s) {
 		return 0, 0, false
 	}
-	if b := skipWhitespace(d.data, entryOffset(s[si])+1); b < len(d.data) && d.data[b] == ']' {
-		return 0, 0, false // empty array
+	elemByteStart := skipWhitespace(d.data, entryOffset(s[si])+1)
+	if elemByteStart >= len(d.data) || d.data[elemByteStart] == ']' {
+		return 0, 0, false
+	}
+	if n == 0 {
+		return elemByteStart, si + 1, true
+	}
+	if n >= 2 {
+		if vs, vj, ok := d.findIndexIndexedTopology(si, n, elemByteStart); ok {
+			return vs, vj, true
+		}
 	}
 	idx := 0
 	elemFirst := si + 1
-	elemByteStart := skipWhitespace(d.data, entryOffset(s[si])+1)
 	for {
 		if idx == n {
 			return elemByteStart, elemFirst, true
@@ -126,11 +133,111 @@ func (d *Document) findIndexIndexed(si int, n int) (valByteStart int, valStruct 
 			elemFirst = tj + 1
 			elemByteStart = skipWhitespace(d.data, entryOffset(s[tj])+1)
 		case kCbrack:
-			return 0, 0, false // n out of range
+			return 0, 0, false
 		default:
 			return 0, 0, false
 		}
 	}
+}
+
+func (d *Document) findIndexIndexedTopology(si, n, firstByte int) (int, int, bool) {
+	s := d.structurals
+	data := d.data
+	e0 := si + 1
+	if e0 >= len(s) || entryKind(s[e0]) != kObrace {
+		return 0, 0, false
+	}
+	t0 := d.skipValueIndex(e0)
+	if t0 >= len(s) || entryKind(s[t0]) != kComma {
+		return 0, 0, false
+	}
+	e1 := t0 + 1
+	if e1 >= len(s) || entryKind(s[e1]) != kObrace {
+		return 0, 0, false
+	}
+	t1 := d.skipValueIndex(e1)
+	if t1 >= len(s) {
+		return 0, 0, false
+	}
+	term1 := entryKind(s[t1])
+	if term1 != kComma && term1 != kCbrack {
+		return 0, 0, false
+	}
+	step := e1 - e0
+	if step < 2 {
+		return 0, 0, false
+	}
+	if t1-e1 != t0-e0 {
+		return 0, 0, false
+	}
+	for k := 0; k < step-1; k++ {
+		if entryKind(s[e0+k]) != entryKind(s[e1+k]) {
+			return 0, 0, false
+		}
+	}
+	if entryKind(s[e0+step-1]) != kComma {
+		return 0, 0, false
+	}
+	target := e0 + n*step
+	if target >= len(s) || entryKind(s[target]) != kObrace {
+		return 0, 0, false
+	}
+	if n >= 2 {
+		mid := e0 + (n/2)*step
+		if mid >= len(s) || entryKind(s[mid]) != kObrace {
+			return 0, 0, false
+		}
+		for k := 0; k < step-1 && k < 8; k++ {
+			if entryKind(s[mid+k]) != entryKind(s[e0+k]) {
+				return 0, 0, false
+			}
+		}
+	}
+	if n >= 8 {
+		q1 := e0 + (n/4)*step
+		q3 := e0 + (n*3/4)*step
+		if q1 >= len(s) || q3 >= len(s) {
+			return 0, 0, false
+		}
+		if entryKind(s[q1]) != kObrace || entryKind(s[q3]) != kObrace {
+			return 0, 0, false
+		}
+	}
+	for k := 0; k < step-1 && k < 12; k++ {
+		if target+k >= len(s) || entryKind(s[target+k]) != entryKind(s[e0+k]) {
+			return 0, 0, false
+		}
+	}
+	tb := entryOffset(s[target])
+	if tb >= len(data) || data[tb] != '{' {
+		return 0, 0, false
+	}
+	if firstByte < len(data) && data[firstByte] == '{' {
+		ks0, ke0, ok0 := objectFirstKey(data, firstByte)
+		if ok0 {
+			ksT, keT, okT := objectFirstKey(data, tb)
+			if !okT || keT-ksT != ke0-ks0 {
+				return 0, 0, false
+			}
+			for i := 0; i < ke0-ks0; i++ {
+				if data[ksT+i] != data[ks0+i] {
+					return 0, 0, false
+				}
+			}
+		}
+	}
+	tt := d.skipValueIndex(target)
+	if tt >= len(s) {
+		return 0, 0, false
+	}
+	tk := entryKind(s[tt])
+	if tk != kComma && tk != kCbrack {
+		return 0, 0, false
+	}
+	if tt-target != t0-e0 {
+		return 0, 0, false
+	}
+	return tb, target, true
 }
 
 // seekIndexed walks the key path over the structural index and returns the byte
