@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/buger/jsonparser"
-	"github.com/tidwall/gjson"
 	"github.com/shiaho777/jseek"
+	"github.com/tidwall/gjson"
 )
 
 // This file validates the synthetic-fixture wins on JSON shaped like real APIs:
@@ -192,6 +192,55 @@ func BenchmarkNDJSON_GJSON(b *testing.B) {
 
 // In-memory fast path: StreamBytes over the whole slice, zero allocation, no
 // reader. This is the apples-to-apples competitor to gjson's in-memory access.
+
+func BenchmarkNDJSON_JseekStreamNDJSON(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var totalLatency int64
+		var errs int
+		_ = jseek.StreamNDJSON(ndjsonFixture, func(elem []byte) error {
+			lat, _ := jseek.GetInt(elem, "latency_ms")
+			totalLatency += lat
+			if st, _ := jseek.GetInt(elem, "status"); st >= 500 {
+				errs++
+			}
+			_, _ = jseek.GetStringUnsafe(elem, "client", "region")
+			return nil
+		})
+		_ = totalLatency
+		_ = errs
+	}
+}
+
+func BenchmarkNDJSON_JseekStreamNDJSONEach(b *testing.B) {
+	q := jseek.CompileStrings(
+		[]string{"latency_ms"},
+		[]string{"status"},
+		[]string{"client", "region"},
+	)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var totalLatency int64
+		var errs int
+		_ = jseek.StreamNDJSONEach(ndjsonFixture, q, func(idx int, value []byte, vt jseek.ValueType, err error) error {
+			switch idx {
+			case 0:
+				if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok {
+					totalLatency += n
+				}
+			case 1:
+				if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok && n >= 500 {
+					errs++
+				}
+			}
+			return nil
+		})
+		_ = totalLatency
+		_ = errs
+	}
+}
+
 func BenchmarkNDJSON_JseekStreamBytes(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

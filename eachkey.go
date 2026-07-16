@@ -12,6 +12,7 @@ package jseek
 // (or CompileStrings) and call Each repeatedly; Each performs no allocation.
 type Paths struct {
 	nodes []pnode
+	npath int
 }
 
 // pnode is one node of the compiled automaton. edges and terminal index into
@@ -33,7 +34,7 @@ type pedge struct {
 // CompileStrings compiles string paths (object keys and bracketed indices like
 // "[0]") into a reusable Paths automaton.
 func CompileStrings(paths ...[]string) *Paths {
-	p := &Paths{nodes: make([]pnode, 1, len(paths)+1)} // node 0 is the root
+	p := &Paths{nodes: make([]pnode, 1, len(paths)+1), npath: len(paths)}
 	for idx, path := range paths {
 		cur := 0
 		for _, seg := range path {
@@ -47,7 +48,7 @@ func CompileStrings(paths ...[]string) *Paths {
 // Compile is like CompileStrings but accepts byte-slice segments, avoiding a
 // string conversion when callers already hold bytes.
 func Compile(paths ...[][]byte) *Paths {
-	p := &Paths{nodes: make([]pnode, 1, len(paths)+1)}
+	p := &Paths{nodes: make([]pnode, 1, len(paths)+1), npath: len(paths)}
 	for idx, path := range paths {
 		cur := 0
 		for _, seg := range path {
@@ -87,52 +88,56 @@ func (p *Paths) descend(from int, seg string) int {
 // per path that is found, with the path's original index. It performs no
 // allocation. Values follow the same aliasing and quote-stripping rules as Get.
 func (p *Paths) Each(data []byte, cb func(idx int, value []byte, dataType ValueType, err error)) {
-	if len(p.nodes) == 0 {
+	if len(p.nodes) == 0 || p.npath == 0 {
 		return
 	}
+	left := p.npath
 	start := skipWhitespace(data, 0)
-	p.match(data, start, 0, cb)
+	p.match(data, start, 0, &left, cb)
 }
 
-func (p *Paths) match(data []byte, i, ni int, cb func(int, []byte, ValueType, error)) {
+func (p *Paths) match(data []byte, i, ni int, left *int, cb func(int, []byte, ValueType, error)) {
+	if *left == 0 {
+		return
+	}
 	node := &p.nodes[ni]
 	if len(node.terminal) > 0 {
 		vs, ve, vt, ok := valueBounds(data, i)
 		if !ok {
 			for _, idx := range node.terminal {
 				cb(idx, nil, NotExist, ErrMalformedJSON)
+				*left--
 			}
 		} else {
 			val := data[vs:ve]
 			for _, idx := range node.terminal {
 				cb(idx, val, vt, nil)
+				*left--
 			}
 		}
 	}
-	if len(node.edges) == 0 || i >= len(data) {
+	if *left == 0 || len(node.edges) == 0 || i >= len(data) {
 		return
 	}
 	switch data[i] {
 	case '{':
-		p.matchObject(data, i, ni, cb)
+		p.matchObject(data, i, ni, left, cb)
 	case '[':
-		p.matchArray(data, i, ni, cb)
+		p.matchArray(data, i, ni, left, cb)
 	}
 }
 
-func (p *Paths) matchObject(data []byte, oi, ni int, cb func(int, []byte, ValueType, error)) {
+func (p *Paths) matchObject(data []byte, oi, ni int, left *int, cb func(int, []byte, ValueType, error)) {
 	i := skipWhitespace(data, oi+1)
 	if i < len(data) && data[i] == '}' {
 		return
 	}
-	// used tracks which edges have already matched within THIS object so that,
-	// like Get, the first occurrence of a duplicate key wins. A stack-resident
-	// bitmask keeps this allocation-free; for the pathological case of >64
-	// distinct requested keys at one depth we simply stop deduplicating, which
-	// only affects malformed duplicate-key input.
 	var used uint64
 	edges := p.nodes[ni].edges
 	for i < len(data) {
+		if *left == 0 {
+			return
+		}
 		if data[i] != '"' {
 			return
 		}
@@ -147,24 +152,27 @@ func (p *Paths) matchObject(data []byte, oi, ni int, cb func(int, []byte, ValueT
 		}
 		i = skipWhitespace(data, i+1)
 
-		// Linear scan of this node's edges for a matching object key. Edge
-		// counts are tiny (number of distinct requested keys at this depth), so
-		// this is faster than a map and allocates nothing.
+		matched := false
 		for ei := range edges {
 			e := &edges[ei]
 			if e.isIndex {
 				continue
 			}
 			if ei < 64 && used&(1<<uint(ei)) != 0 {
-				continue // already matched earlier in this object
+				continue
 			}
 			if keyMatches(data, ks, ke-1, e.key) {
 				if ei < 64 {
 					used |= 1 << uint(ei)
 				}
-				p.match(data, i, e.child, cb)
+				p.match(data, i, e.child, left, cb)
+				matched = true
 				break
 			}
+		}
+		_ = matched
+		if *left == 0 {
+			return
 		}
 		var sok bool
 		if i, sok = skipValue(data, i); !sok {
@@ -185,7 +193,7 @@ func (p *Paths) matchObject(data []byte, oi, ni int, cb func(int, []byte, ValueT
 	}
 }
 
-func (p *Paths) matchArray(data []byte, ai, ni int, cb func(int, []byte, ValueType, error)) {
+func (p *Paths) matchArray(data []byte, ai, ni int, left *int, cb func(int, []byte, ValueType, error)) {
 	edges := p.nodes[ni].edges
 	nWant := 0
 	for _, e := range edges {
@@ -223,6 +231,9 @@ func (p *Paths) matchArray(data []byte, ai, ni int, cb func(int, []byte, ValueTy
 	cur := -1
 	pos := 0
 	for _, w := range want {
+		if *left == 0 {
+			return
+		}
 		var ok bool
 		if cur < 0 {
 			pos, ok = findIndex(data, ai, w.index)
@@ -240,14 +251,11 @@ func (p *Paths) matchArray(data []byte, ai, ni int, cb func(int, []byte, ValueTy
 		if !ok {
 			continue
 		}
-		p.match(data, pos, w.child, cb)
+		p.match(data, pos, w.child, left, cb)
 		cur = w.index
 	}
 }
 
-// EachKey extracts multiple byte-slice paths in a single pass. It compiles the
-// paths on each call; for repeated queries, prefer Compile + Paths.Each to
-// avoid the compile cost.
 func EachKey(data []byte, cb func(idx int, value []byte, dataType ValueType, err error), paths ...[][]byte) {
 	if len(paths) == 0 {
 		return
