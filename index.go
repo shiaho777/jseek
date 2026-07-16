@@ -246,6 +246,24 @@ func indexStructurals(data []byte, out []uint32) []uint32 {
 				i = end
 				continue
 			}
+			if sk == kObrack {
+				out = append(out, packEntry(kObrack, uint32(i)))
+				i++
+				j := i
+				if j < n && (data[j] == ' ' || data[j] == 9 || data[j] == 10 || data[j] == 13) {
+					j = indexSkipWhitespace(data, j)
+				}
+				if j < n && data[j] == '{' {
+					mark := len(out)
+					if out2, end, ok := indexObjectArraySTE(data, j, out); ok {
+						out = out2
+						i = end
+						continue
+					}
+					out = out[:mark]
+				}
+				continue
+			}
 			out = append(out, packEntry(sk, uint32(i)))
 			i++
 			continue
