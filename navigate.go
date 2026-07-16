@@ -53,7 +53,6 @@ func scanKey(data []byte, i int, key string) (keyEnd int, matched bool, ok bool)
 			return p + 1, matched && ki == klen, true
 		}
 		if c == '\\' {
-			// Escapes present: fall back to the accurate, allocation-free path.
 			ke, sok := skipString(data, i)
 			if !sok {
 				return ke, false, false
@@ -69,18 +68,30 @@ func scanKey(data []byte, i int, key string) (keyEnd int, matched bool, ok bool)
 		}
 		p++
 	}
-	return p, false, false // unterminated string (malformed)
+	return p, false, false
 }
 
 // findKey locates the value for key within the object beginning at data[oi]
 // (data[oi] must be '{'). It returns the index of the start of the value (past
 // whitespace) and true if found.
 func findKey(data []byte, oi int, key string) (int, bool) {
-	i := skipWhitespace(data, oi+1)
-	if i < len(data) && data[i] == '}' {
+	n := len(data)
+	i := oi + 1
+	if i >= n {
 		return i, false
 	}
-	for i < len(data) {
+	c := data[i]
+	if c == ' ' || c == 9 || c == 10 || c == 13 {
+		i = skipWhitespace(data, i)
+		if i >= n {
+			return i, false
+		}
+		c = data[i]
+	}
+	if c == '}' {
+		return i, false
+	}
+	for i < n {
 		if data[i] != '"' {
 			return i, false
 		}
@@ -88,64 +99,489 @@ func findKey(data []byte, oi int, key string) (int, bool) {
 		if !ok {
 			return ke, false
 		}
-		i = skipWhitespace(data, ke)
-		if i >= len(data) || data[i] != ':' {
+		i = ke
+		if i >= n {
 			return i, false
 		}
-		i = skipWhitespace(data, i+1)
+		if data[i] == ':' {
+			i++
+		} else {
+			i = skipWhitespace(data, i)
+			if i >= n || data[i] != ':' {
+				return i, false
+			}
+			i++
+		}
+		if i < n {
+			c = data[i]
+			if c == ' ' || c == 9 || c == 10 || c == 13 {
+				i = skipWhitespace(data, i)
+			}
+		}
 		if match {
 			return i, true
 		}
-		// Skip this value and continue to the next member.
 		if i, ok = skipValue(data, i); !ok {
 			return i, false
 		}
-		i = skipWhitespace(data, i)
-		if i >= len(data) {
+		if i >= n {
 			return i, false
 		}
-		switch data[i] {
-		case ',':
-			i = skipWhitespace(data, i+1)
-		case '}':
+		c = data[i]
+		if c == ',' {
+			i++
+			if i < n {
+				c = data[i]
+				if c == ' ' || c == 9 || c == 10 || c == 13 {
+					i = skipWhitespace(data, i)
+				}
+			}
+			continue
+		}
+		if c == ' ' || c == 9 || c == 10 || c == 13 {
+			i = skipWhitespace(data, i)
+			if i >= n {
+				return i, false
+			}
+			switch data[i] {
+			case ',':
+				i++
+				if i < n {
+					c = data[i]
+					if c == ' ' || c == 9 || c == 10 || c == 13 {
+						i = skipWhitespace(data, i)
+					}
+				}
+				continue
+			case '}':
+				return i, false
+			default:
+				return i, false
+			}
+		}
+		if c == '}' {
 			return i, false
-		default:
+		}
+		return i, false
+	}
+	return i, false
+}
+
+func findIndexGeneric(data []byte, ai int, n int) (int, bool) {
+	nlen := len(data)
+	i := ai + 1
+	if i >= nlen {
+		return i, false
+	}
+	c := data[i]
+	if c == ' ' || c == 9 || c == 10 || c == 13 {
+		i = skipWhitespace(data, i)
+		if i >= nlen {
 			return i, false
+		}
+		c = data[i]
+	}
+	if c == ']' {
+		return i, false
+	}
+	if c == '{' {
+		return findIndexObjectStride(data, i, n, nlen)
+	}
+	return findIndexSlow(data, i, n, nlen)
+}
+
+func objectFirstKey(data []byte, obj int) (start, end int, ok bool) {
+	nlen := len(data)
+	if obj >= nlen || data[obj] != '{' {
+		return 0, 0, false
+	}
+	j := obj + 1
+	if j < nlen && (data[j] == ' ' || data[j] == 9 || data[j] == 10 || data[j] == 13) {
+		j = skipWhitespace(data, j)
+	}
+	if j >= nlen || data[j] != '"' {
+		return 0, 0, false
+	}
+	start = j + 1
+	j = start
+	for j < nlen {
+		c := data[j]
+		if c == '"' {
+			return start, j, true
+		}
+		if c == '\\' {
+			return 0, 0, false
+		}
+		j++
+	}
+	return 0, 0, false
+}
+
+func firstKeyEqual(data []byte, obj int, ks, ke int) bool {
+	nlen := len(data)
+	if obj >= nlen || data[obj] != '{' {
+		return false
+	}
+	klen := ke - ks
+	p := obj + 1
+	if p >= nlen {
+		return false
+	}
+	if data[p] != '"' {
+		if data[p] == ' ' || data[p] == 9 || data[p] == 10 || data[p] == 13 {
+			p = skipWhitespace(data, p)
+			if p >= nlen || data[p] != '"' {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	p++
+	if p+klen >= nlen || data[p+klen] != '"' {
+		return false
+	}
+	for i := 0; i < klen; i++ {
+		if data[p+i] != data[ks+i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasNestedObjectArray(data []byte, start, end int) bool {
+	i := start + 1
+	for i < end {
+		c := data[i]
+		if c == '"' {
+			i++
+			for i < end {
+				c = data[i]
+				if c == '"' {
+					i++
+					break
+				}
+				if c == '\\' {
+					i += 2
+					continue
+				}
+				i++
+			}
+			continue
+		}
+		if c == '[' {
+			j := i + 1
+			for j < end {
+				cj := data[j]
+				if cj == ' ' || cj == 9 || cj == 10 || cj == 13 {
+					j++
+					continue
+				}
+				if cj == '{' {
+					return true
+				}
+				break
+			}
+		}
+		i++
+	}
+	return false
+}
+
+func strideObject(data []byte, i, lastLen, nlen int, ks, ke int, haveKey bool) (int, bool) {
+	if lastLen < 2 {
+		return i, false
+	}
+	end := i + lastLen
+	if end+1 >= nlen || data[i] != '{' || data[end-1] != '}' {
+		return i, false
+	}
+	if data[end] == ',' {
+		ni := end + 1
+		if data[ni] == '{' {
+			if haveKey && !firstKeyEqual(data, ni, ks, ke) {
+				return i, false
+			}
+			return ni, true
+		}
+		if data[ni] == ' ' || data[ni] == 9 || data[ni] == 10 || data[ni] == 13 {
+			ni = skipWhitespace(data, ni)
+			if ni < nlen && data[ni] == '{' {
+				if haveKey && !firstKeyEqual(data, ni, ks, ke) {
+					return i, false
+				}
+				return ni, true
+			}
+		}
+		return i, false
+	}
+	if data[end] == ' ' || data[end] == 9 || data[end] == 10 || data[end] == 13 {
+		ni := skipWhitespace(data, end)
+		if ni >= nlen || data[ni] != ',' {
+			return i, false
+		}
+		ni++
+		if ni < nlen && (data[ni] == ' ' || data[ni] == 9 || data[ni] == 10 || data[ni] == 13) {
+			ni = skipWhitespace(data, ni)
+		}
+		if ni < nlen && data[ni] == '{' {
+			if haveKey && !firstKeyEqual(data, ni, ks, ke) {
+				return i, false
+			}
+			return ni, true
 		}
 	}
 	return i, false
 }
 
-// findIndex locates element n (zero-based) within the array beginning at
-// data[ai] (data[ai] must be '['). Returns the start index of the element value
-// and true if found.
-func findIndex(data []byte, ai int, n int) (int, bool) {
-	i := skipWhitespace(data, ai+1)
-	if i < len(data) && data[i] == ']' {
+func objectLenMinified(data []byte, pos, lastLen, nlen int) bool {
+	end := pos + lastLen
+	if end > nlen || lastLen < 2 || data[pos] != '{' || data[end-1] != '}' {
+		return false
+	}
+	if end == nlen {
+		return true
+	}
+	c := data[end]
+	return c == ',' || c == ']' || c == ' ' || c == 9 || c == 10 || c == 13
+}
+
+func tryDirectJump(data []byte, i, remain, lastLen, nlen int, ks, ke int, haveKey bool) (int, bool) {
+	if remain <= 0 || lastLen < 2 {
 		return i, false
 	}
+	step := lastLen + 1
+	probe := i + remain*step
+	if probe >= nlen || data[i] != '{' || data[probe] != '{' {
+		return i, false
+	}
+	if !objectLenMinified(data, i, lastLen, nlen) {
+		return i, false
+	}
+	if haveKey && !firstKeyEqual(data, probe, ks, ke) {
+		return i, false
+	}
+	if remain >= 1 {
+		prev := i + (remain-1)*step
+		if prev != i {
+			if data[prev] != '{' || !objectLenMinified(data, prev, lastLen, nlen) {
+				return i, false
+			}
+		}
+	}
+	if remain >= 2 {
+		mid := i + (remain/2)*step
+		if data[mid] != '{' || !objectLenMinified(data, mid, lastLen, nlen) {
+			return i, false
+		}
+		if haveKey && !firstKeyEqual(data, mid, ks, ke) {
+			return i, false
+		}
+	}
+	if remain >= 8 {
+		q1 := i + (remain/4)*step
+		q3 := i + (remain*3/4)*step
+		if data[q1] != '{' || !objectLenMinified(data, q1, lastLen, nlen) {
+			return i, false
+		}
+		if data[q3] != '{' || !objectLenMinified(data, q3, lastLen, nlen) {
+			return i, false
+		}
+	}
+	if remain >= 32 {
+		for k := 8; k < remain; k += 8 {
+			pos := i + k*step
+			if pos >= probe {
+				break
+			}
+			if data[pos] != '{' || data[pos+lastLen-1] != '}' || data[pos+lastLen] != ',' {
+				return i, false
+			}
+		}
+	}
+	return probe, true
+}
+
+func strideObjectsMinified(data []byte, i, lastLen, count, nlen int, ks, ke int, haveKey bool) (int, int, bool) {
+	if lastLen < 2 || count <= 0 || i+lastLen+1 >= nlen {
+		return i, 0, false
+	}
+	if data[i] != '{' {
+		return i, 0, false
+	}
+	if count >= 4 {
+		if ni, ok := tryDirectJump(data, i, count, lastLen, nlen, ks, ke, haveKey); ok {
+			return ni, count, true
+		}
+	}
+	pos := i
+	for j := 0; j < count; j++ {
+		end := pos + lastLen
+		if end+1 >= nlen || data[end-1] != '}' || data[end] != ',' || data[end+1] != '{' {
+			if j == 0 {
+				return i, 0, false
+			}
+			if haveKey && !firstKeyEqual(data, pos, ks, ke) {
+				return i, 0, false
+			}
+			return pos, j, true
+		}
+		pos = end + 1
+	}
+	if haveKey && !firstKeyEqual(data, pos, ks, ke) {
+		return i, 0, false
+	}
+	return pos, count, true
+}
+
+func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
+	if n == 0 {
+		return i, true
+	}
+	lastLen := 0
+	ks, ke := 0, 0
+	haveKey := false
+	strideOK := false
+	minified := false
+	base := i
+	for idx := 0; idx < n; {
+		if i >= nlen || data[i] != '{' {
+			return findIndexSlow(data, i, n-idx, nlen)
+		}
+		if strideOK && lastLen > 0 {
+			remain := n - idx
+			if minified {
+				if ni, jumped, ok := strideObjectsMinified(data, i, lastLen, remain, nlen, ks, ke, haveKey); ok {
+					i = ni
+					idx += jumped
+					continue
+				}
+			}
+			if ni, ok := strideObject(data, i, lastLen, nlen, ks, ke, haveKey); ok {
+				i = ni
+				idx++
+				continue
+			}
+		}
+		start := i
+		var ok bool
+		i, ok = skipContainer(data, i)
+		if !ok {
+			return i, false
+		}
+		lastLen = i - start
+		if !haveKey {
+			if s, e, kok := objectFirstKey(data, start); kok {
+				ks, ke = s, e
+				haveKey = true
+			}
+		}
+		if !strideOK && lastLen > 0 {
+			strideOK = !hasNestedObjectArray(data, start, start+lastLen)
+			if strideOK && i < nlen && data[i] == ',' {
+				minified = true
+			}
+		}
+		if minified && strideOK && lastLen > 0 && n >= 4 {
+			if ni, ok := tryDirectJump(data, base, n, lastLen, nlen, ks, ke, haveKey); ok {
+				return ni, true
+			}
+		}
+		if i >= nlen {
+			return i, false
+		}
+		c := data[i]
+		if c == ',' {
+			i++
+			if i < nlen && (data[i] == ' ' || data[i] == 9 || data[i] == 10 || data[i] == 13) {
+				i = skipWhitespace(data, i)
+				minified = false
+			}
+			idx++
+			if minified && strideOK && lastLen > 0 {
+				remain := n - idx
+				if remain >= 4 {
+					if ni, ok := tryDirectJump(data, i, remain, lastLen, nlen, ks, ke, haveKey); ok {
+						return ni, true
+					}
+				}
+			}
+			continue
+		}
+		if c == ' ' || c == 9 || c == 10 || c == 13 {
+			minified = false
+			i = skipWhitespace(data, i)
+			if i >= nlen {
+				return i, false
+			}
+			if data[i] == ',' {
+				i++
+				if i < nlen && (data[i] == ' ' || data[i] == 9 || data[i] == 10 || data[i] == 13) {
+					i = skipWhitespace(data, i)
+				}
+				idx++
+				continue
+			}
+		}
+		return i, false
+	}
+	return i, true
+}
+
+func findIndexSlow(data []byte, i int, n int, nlen int) (int, bool) {
 	idx := 0
-	for i < len(data) {
+	for i < nlen {
 		if idx == n {
 			return i, true
 		}
 		var ok bool
-		if i, ok = skipValue(data, i); !ok {
+		c := data[i]
+		if c == '{' || c == '[' {
+			i, ok = skipContainer(data, i)
+			if !ok {
+				return i, false
+			}
+		} else {
+			i, ok = skipValue(data, i)
+			if !ok {
+				return i, false
+			}
+		}
+		if i >= nlen {
 			return i, false
 		}
-		i = skipWhitespace(data, i)
-		if i >= len(data) {
-			return i, false
-		}
-		switch data[i] {
-		case ',':
-			i = skipWhitespace(data, i+1)
+		c = data[i]
+		if c == ',' {
+			i++
 			idx++
-		case ']':
-			return i, false
-		default:
+			if i < nlen && (data[i] == ' ' || data[i] == 9 || data[i] == 10 || data[i] == 13) {
+				i = skipWhitespace(data, i)
+			}
+			continue
+		}
+		if c == ']' {
 			return i, false
 		}
+		if c == ' ' || c == 9 || c == 10 || c == 13 {
+			i = skipWhitespace(data, i)
+			if i >= nlen {
+				return i, false
+			}
+			c = data[i]
+			if c == ',' {
+				i++
+				idx++
+				if i < nlen && (data[i] == ' ' || data[i] == 9 || data[i] == 10 || data[i] == 13) {
+					i = skipWhitespace(data, i)
+				}
+				continue
+			}
+			if c == ']' {
+				return i, false
+			}
+			return i, false
+		}
+		return i, false
 	}
 	return i, false
 }
