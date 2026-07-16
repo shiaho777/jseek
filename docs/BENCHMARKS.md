@@ -112,7 +112,7 @@ Reading 12 scattered fields from one 24 KB document.
 | Approach | time | allocs |
 | --- | --- | --- |
 | Stateless `Get` ×12 (re-scan each) | **86 µs** | 0 B |
-| `IndexPooled` + 12 queries | ~206 µs | ~1 B |
+| `IndexPooled` + 12 queries (STE Stage-1) | **~59–62 µs** | 0 B |
 | **Reused index, 12 queries** | **~44 µs** | 0 B |
 | gjson `GetManyBytes` | 469 µs | 1.16 KB |
 | sonic (arm64 cold) | 119 µs | 572 B |
@@ -189,16 +189,20 @@ line-mode `ReadSlice` so the Reader path matches StreamNDJSON within noise
 instead of paying full JSON value framing (~40% faster than generic
 `NewDecoder`). Multi-path early-exit still skips trailing junk keys.
 
-## Result 7:## Result 6b: Stage-1 index build
+## Result 6b: Stage-1 index build — Structural Template Expansion (STE)
 
-| Fixture | time | notes |
-| --- | --- | --- |
-| large (~24 KB, 500 users) | **~61–67 µs** | short-string inline + NEON structural find |
-| GitHub-style (~60 KB, 200 issues) | **~30–33 µs** | same Stage-1 path |
+| Fixture | time | prior (no STE) | speedup |
+| --- | --- | --- | --- |
+| large (~24 KB, 500 users) | **~18 µs** | ~65 µs | **~3.6×** |
+| GitHub-style (~60 KB, 200 issues) | **~15 µs** | ~30 µs | **~2.1×** |
 
-**Takeaway:** Stage-1 remains the gate for cold indexed/tape paths; NEON
-structural search and short unescaped string skips cut build cost without
-changing the Document API.
+**Takeaway:** **Structural Template Expansion** is a Stage-1 breakthrough unique
+to jseek. On homogeneous object arrays it fully indexes only the first element
+of each equal-size run, captures the structural kind/relative-offset template,
+then **synthesizes** the remaining elements' structurals without re-scanning
+string bodies — reseeding when digit growth changes object width. Combined with
+short-string inline skip and NEON structural find, cold `Index` is no longer the
+tax that made one-shot indexed multi-get lose to pure FASS.
 
 ## Result 7: scan micro-throughput (string body)
 
@@ -277,6 +281,7 @@ multi-path (Result 6).
 6. **`StreamNDJSON` + `Paths` early-exit** — SWAR newline split; stop object walk when all paths hit.
 7. **Topology-constant array stride** — indexed deep `arr[N]` jumps by structural step when element topologies match (digit growth OK).
 8. **`NewNDJSONDecoder`** — line-mode Reader path for JSON Lines without full value framing.
+9. **Structural Template Expansion (STE)** — synthesize Stage-1 structurals for equal-size object-array runs; skip interior re-scan.
 
 ## Discipline about the numbers
 

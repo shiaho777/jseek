@@ -45,7 +45,7 @@ combining three things no other lazy extractor brings together:
 2. **A SWAR + SIMD scan core** — portable 8-byte SWAR everywhere; AVX2 (amd64)
    and NEON (arm64) string/container kernels behind the same seam (`purego`
    forces SWAR only).
-3. **An index-once / query-many engine** plus `GetFields`, pinned, and columnar
+3. **Structural Template Expansion + index-once / query-many** plus `GetFields`, pinned, and columnar
    APIs that turn repeated work into one-time work — where the lead over
    everything else widens to **double-digit multiples**.
 
@@ -86,7 +86,7 @@ targets without assembly. The public API never changes across these backends.
 ### Array navigation: FASS equal-size strides
 
 Homogeneous object arrays (common in API lists and event batches) enable a
-**fingerprint-anchored structural stride**: after two consecutive elements
+**Structural Template Expansion** on Stage-1 (synthesize structurals for equal-size object-array runs) plus **fingerprint-anchored structural stride**: after two consecutive elements
 verify the same `skipContainer` length, jseek jumps by fixed size instead of
 re-parsing each sibling. Direct multi-element jumps re-validate the landing
 object so endpoint shape alone cannot accept a false index on malformed input.

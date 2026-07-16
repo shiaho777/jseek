@@ -55,7 +55,7 @@ structure instead of re-reading bytes.
 | `escape.go` | allocation-free escape compare and unescape (full `\uXXXX`) |
 | `number.go` | allocation-free int/float/bool parsing |
 | `jseek.go` | stateless public API + shared `valueAt` extractor |
-| `index.go` | Stage-1 structural index builder (`Index`, `Document`, pool) |
+| `index.go` / `index_ste.go` | Stage-1 structural index + **STE** template expansion for object arrays |
 | `index_nav.go` | Stage-2 navigation over the index + topology-constant array stride + `Document` getters |
 | `index_tape.go` | optional O(1) skip-pointer tape for deep navigation |
 | `eachkey.go` | compiled multi-path matcher (`Paths`, `EachKey`) |
@@ -161,6 +161,23 @@ member walk, using a small active-key set rather than a full multi-path trie.
   the matrix). Fuzz **seed corpus** is required after tests; short generative
   fuzz is informational. A nightly workflow runs long generative campaigns.
   Concurrent same-ref runs cancel in progress so only the tip commit finishes.
+
+## Structural Template Expansion (STE)
+
+Stage-1 normally touches every string body. For **homogeneous object arrays**
+(the dominant real-world shape behind `users[]`, `issues[]`, log batches), STE
+does something different:
+
+1. Fully index the first object of an equal-size run → a template of
+   `(kind, relative_offset)` pairs.
+2. Confirm the next object matches length and template anchors.
+3. **Expand** the template across the rest of the run (bulk-expand with
+   mid/quartile probes on long minified runs) — no interior string scan.
+4. On digit-growth / size change, reseed a new template and continue.
+
+Navigation, topology stride, and the skip tape see a normal dense structural
+index; they do not know STE ran. Correctness falls back to full indexing with
+output rollback if a run cannot be confirmed.
 
 ## Topology-constant array stride (indexed)
 
