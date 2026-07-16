@@ -106,7 +106,7 @@ fail:
 	RET
 
 // func skipStringBodyAVX2(data []byte, i int) (int, bool)
-TEXT ·skipStringBodyAVX2(SB), NOSPLIT, $0-49
+TEXT ·skipStringBodyAVX2(SB), NOSPLIT, $0-41
 	MOVQ	data_base+0(FP), SI
 	MOVQ	data_len+8(FP), BX
 	MOVQ	i+24(FP), DX
@@ -168,7 +168,7 @@ ss_quote_cx:
 	MOVQ	data_base+0(FP), AX
 	SUBQ	AX, DI
 	MOVQ	DI, ret+32(FP)
-	MOVB	$1, ret+40(FP)
+	MOVB	$1, ret1+40(FP)
 	RET
 
 ss_sse:
@@ -218,7 +218,7 @@ ss_quote_cx_sse:
 	MOVQ	data_base+0(FP), AX
 	SUBQ	AX, DI
 	MOVQ	DI, ret+32(FP)
-	MOVB	$1, ret+40(FP)
+	MOVB	$1, ret1+40(FP)
 	RET
 
 ss_tail:
@@ -247,11 +247,11 @@ ss_quote_byte:
 	MOVQ	data_base+0(FP), AX
 	SUBQ	AX, DI
 	MOVQ	DI, ret+32(FP)
-	MOVB	$1, ret+40(FP)
+	MOVB	$1, ret1+40(FP)
 	RET
 
 ss_fail:
 	MOVQ	data_len+8(FP), AX
 	MOVQ	AX, ret+32(FP)
-	MOVB	$0, ret+40(FP)
+	MOVB	$0, ret1+40(FP)
 	RET
