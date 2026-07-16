@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/buger/jsonparser"
-	"github.com/tidwall/gjson"
 	"github.com/shiaho777/jseek"
+	"github.com/tidwall/gjson"
 )
 
 // smallFixture is a ~190 byte http-log style record (matches the classic
@@ -124,6 +124,19 @@ func BenchmarkLargeIndexed_JSONParser(b *testing.B) {
 }
 
 // Iterate the whole array, reading two fields per element.
+
+func BenchmarkLargeArrayFields_Jseek(b *testing.B) {
+	b.ReportAllocs()
+	keys := []string{"username", "followers"}
+	path := []string{"users"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = jseek.EachArrayFields(largeFixture, path, keys, func(elem, key int, value []byte, vt jseek.ValueType, err error) bool {
+			_ = value
+			return true
+		})
+	}
+}
 
 func BenchmarkLargeArrayEach_Jseek(b *testing.B) {
 	b.ReportAllocs()

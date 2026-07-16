@@ -234,3 +234,190 @@ func EachFieldInto(data []byte, path []string, keys []string, offs []int, cb fun
 		cb(i, v, vt, err)
 	}
 }
+
+func walkObjectFields(data []byte, oi int, keys []string, dst []int) (end int, ok bool) {
+	nlen := len(data)
+	nk := len(keys)
+	if nk == 0 {
+		return skipContainer(data, oi)
+	}
+	limit := nk
+	if limit > len(dst) {
+		limit = len(dst)
+	}
+	for i := 0; i < limit; i++ {
+		dst[i] = -1
+	}
+	found := 0
+	matching := true
+	i := oi + 1
+	if i >= nlen {
+		return i, false
+	}
+	c := data[i]
+	if c == ' ' || c == 9 || c == 10 || c == 13 {
+		i = skipWhitespace(data, i)
+		if i >= nlen {
+			return i, false
+		}
+		c = data[i]
+	}
+	if c == '}' {
+		return i + 1, true
+	}
+	for i < nlen {
+		if data[i] != '"' {
+			return i, false
+		}
+		var ke int
+		var which int
+		var sok bool
+		if matching {
+			ke, which, sok = scanKeyWhich(data, i, keys, dst)
+		} else {
+			ke, sok = skipString(data, i)
+			which = -1
+		}
+		if !sok {
+			return ke, false
+		}
+		i = ke
+		if i >= nlen {
+			return i, false
+		}
+		if data[i] == ':' {
+			i++
+		} else {
+			i = skipWhitespace(data, i)
+			if i >= nlen || data[i] != ':' {
+				return i, false
+			}
+			i++
+		}
+		if i < nlen {
+			c = data[i]
+			if c == ' ' || c == 9 || c == 10 || c == 13 {
+				i = skipWhitespace(data, i)
+			}
+		}
+		if matching && which >= 0 && which < limit && dst[which] == -1 {
+			dst[which] = i
+			found++
+			if found == limit {
+				matching = false
+			}
+		}
+		if i, ok = skipValue(data, i); !ok {
+			return i, false
+		}
+		if i >= nlen {
+			return i, false
+		}
+		c = data[i]
+		if c == ',' {
+			i++
+			if i < nlen {
+				c = data[i]
+				if c == ' ' || c == 9 || c == 10 || c == 13 {
+					i = skipWhitespace(data, i)
+				}
+			}
+			continue
+		}
+		if c == ' ' || c == 9 || c == 10 || c == 13 {
+			i = skipWhitespace(data, i)
+			if i >= nlen {
+				return i, false
+			}
+			if data[i] == ',' {
+				i++
+				if i < nlen {
+					c = data[i]
+					if c == ' ' || c == 9 || c == 10 || c == 13 {
+						i = skipWhitespace(data, i)
+					}
+				}
+				continue
+			}
+			if data[i] == '}' {
+				return i + 1, true
+			}
+			return i, false
+		}
+		if c == '}' {
+			return i + 1, true
+		}
+		return i, false
+	}
+	return i, false
+}
+
+func EachArrayFields(data []byte, path []string, keys []string, cb func(elem, key int, value []byte, dataType ValueType, err error) bool) error {
+	start, ok := seek(data, path)
+	if !ok {
+		return ErrKeyPathNotFound
+	}
+	if start >= len(data) || data[start] != '[' {
+		return ErrUnexpectedType
+	}
+	nlen := len(data)
+	i := skipWhitespace(data, start+1)
+	if i < nlen && data[i] == ']' {
+		return nil
+	}
+	nk := len(keys)
+	var stack [16]int
+	var dst []int
+	if nk <= len(stack) {
+		dst = stack[:nk]
+	} else {
+		dst = make([]int, nk)
+	}
+	elem := 0
+	for i < nlen {
+		if data[i] == '{' {
+			end, wok := walkObjectFields(data, i, keys, dst)
+			if !wok {
+				return ErrMalformedJSON
+			}
+			for k := 0; k < nk; k++ {
+				if dst[k] < 0 {
+					if !cb(elem, k, nil, NotExist, ErrKeyPathNotFound) {
+						return nil
+					}
+					continue
+				}
+				v, vt, _, err := valueAt(data, dst[k])
+				if !cb(elem, k, v, vt, err) {
+					return nil
+				}
+			}
+			i = end
+		} else {
+			vs, ve, vt, vok := valueBounds(data, i)
+			if !vok {
+				return ErrMalformedJSON
+			}
+			_ = vs
+			if vt == String {
+				i = ve + 1
+			} else {
+				i = ve
+			}
+		}
+		i = skipWhitespace(data, i)
+		if i >= nlen {
+			return ErrMalformedJSON
+		}
+		switch data[i] {
+		case ',':
+			i = skipWhitespace(data, i+1)
+			elem++
+		case ']':
+			return nil
+		default:
+			return ErrMalformedJSON
+		}
+	}
+	return ErrMalformedJSON
+}

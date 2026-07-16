@@ -254,19 +254,11 @@ func hasNestedObjectArray(data []byte, start, end int) bool {
 	for i < end {
 		c := data[i]
 		if c == '"' {
-			i++
-			for i < end {
-				c = data[i]
-				if c == '"' {
-					i++
-					break
-				}
-				if c == '\\' {
-					i += 2
-					continue
-				}
-				i++
+			e, ok := skipStringBody(data, i+1)
+			if !ok || e > end {
+				return false
 			}
+			i = e
 			continue
 		}
 		if c == '[' {
@@ -277,17 +269,14 @@ func hasNestedObjectArray(data []byte, start, end int) bool {
 					j++
 					continue
 				}
-				if cj == '{' {
-					return true
-				}
-				break
+				return cj == '{'
 			}
+			return false
 		}
 		i++
 	}
 	return false
 }
-
 func strideObject(data []byte, i, lastLen, nlen int, ks, ke int, haveKey bool) (int, bool) {
 	if lastLen < 2 {
 		return i, false
