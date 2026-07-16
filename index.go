@@ -134,7 +134,7 @@ func Index(data []byte) *Document {
 		d.oversize = true
 		return d
 	}
-	d.structurals = make([]uint32, 0, len(data)/8+8)
+	d.structurals = make([]uint32, 0, len(data)/6+32)
 	d.structurals = indexStructurals(data, d.structurals)
 	return d
 }
@@ -173,7 +173,7 @@ func (d *Document) Reset(data []byte) *Document {
 	}
 	d.oversize = false
 	if d.structurals == nil {
-		d.structurals = make([]uint32, 0, len(data)/8+8)
+		d.structurals = make([]uint32, 0, len(data)/6+32)
 	} else {
 		d.structurals = d.structurals[:0]
 	}
@@ -195,8 +195,8 @@ func IndexPooled(data []byte) *Document {
 		return d
 	}
 	d.oversize = false
-	if cap(d.structurals) < len(data)/8+8 {
-		d.structurals = make([]uint32, 0, len(data)/8+8)
+	if cap(d.structurals) < len(data)/6+32 {
+		d.structurals = make([]uint32, 0, len(data)/6+32)
 	} else {
 		d.structurals = d.structurals[:0]
 	}
@@ -231,25 +231,41 @@ func indexStructurals(data []byte, out []uint32) []uint32 {
 	i := 0
 	for i < n {
 		c := data[i]
-		if c == '"' {
+		switch c {
+		case '"':
 			out = append(out, packEntry(kQuote, uint32(i)))
 			end, ok := skipString(data, i)
 			if !ok {
 				return out
 			}
 			i = end
-			continue
-		}
-		if k := structuralKind[c]; k != kNone {
-			out = append(out, packEntry(k, uint32(i)))
+		case '{':
+			out = append(out, packEntry(kObrace, uint32(i)))
 			i++
-			continue
-		}
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+		case '}':
+			out = append(out, packEntry(kCbrace, uint32(i)))
+			i++
+		case '[':
+			out = append(out, packEntry(kObrack, uint32(i)))
+			i++
+		case ']':
+			out = append(out, packEntry(kCbrack, uint32(i)))
+			i++
+		case ':':
+			out = append(out, packEntry(kColon, uint32(i)))
+			i++
+		case ',':
+			out = append(out, packEntry(kComma, uint32(i)))
+			i++
+		case ' ', '\t', '\n', '\r':
 			i = indexSkipWhitespace(data, i)
-			continue
+		default:
+			j := indexStructuralOrQuote(data, i+1)
+			if j < 0 || j >= n {
+				return out
+			}
+			i = j
 		}
-		i++
 	}
 	return out
 }
