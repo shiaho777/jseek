@@ -100,6 +100,21 @@ func BenchmarkLargeIndexed_Jseek(b *testing.B) {
 	}
 }
 
+func BenchmarkLargeIndexed_JseekFields(b *testing.B) {
+	b.ReportAllocs()
+	path := []string{"users", "[250]"}
+	keys := []string{"username", "followers"}
+	var offs [2]int
+	for i := 0; i < b.N; i++ {
+		jseek.EachFieldInto(largeFixture, path, keys, offs[:], func(idx int, value []byte, vt jseek.ValueType, err error) {
+			_ = idx
+			_ = value
+			_ = vt
+			_ = err
+		})
+	}
+}
+
 func BenchmarkLargeIndexed_JSONParser(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
