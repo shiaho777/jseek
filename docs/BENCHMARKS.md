@@ -113,7 +113,7 @@ Reading 12 scattered fields from one 24 KB document.
 | --- | --- | --- |
 | Stateless `Get` ×12 (re-scan each) | **86 µs** | 0 B |
 | `IndexPooled` + 12 queries | ~206 µs | ~1 B |
-| **Reused index, 12 queries** | **130 µs** | 0 B |
+| **Reused index, 12 queries** | **~44 µs** | 0 B |
 | gjson `GetManyBytes` | 469 µs | 1.16 KB |
 | sonic (arm64 cold) | 119 µs | 572 B |
 
@@ -125,19 +125,25 @@ win.
 
 ---
 
-## Result 4: skip tape (O(1) subtree skipping)
+## Result 4: skip tape + topology-constant array stride
 
-On the same large document, linear skip vs tape skip (A/B, same binary).
+On the same large document, linear skip vs tape skip (A/B, same binary). Deep
+array access now uses **topology-constant array stride** on the structural
+index: when consecutive elements share the same structural-kind sequence, the
+navigator jumps by structural step instead of walking every element. Unlike
+equal-byte FASS, this works with digit growth (variable number widths).
 
-| Scenario | linear | tape | speedup |
-| --- | --- | --- | --- |
-| 12 scattered fields (reused) | 130 µs | **5.7 µs** | ~23x |
-| deep `users[499].name` | 24.3 µs | **1.58 µs** | ~15x |
-| multi-path `EachDoc` | 50.9 µs (no tape) | **2.59 µs** (tape) | ~20x |
-| multi-path `Each` (stateless baseline) | 48.1 µs | — | — |
+| Scenario | linear (topology) | tape (+ topology) | prior linear | speedup vs prior linear |
+| --- | --- | --- | --- | --- |
+| 12 scattered fields (reused) | ~44 µs | **5.7 µs** | 130 µs | — |
+| deep `users[499].name` | **0.25 µs** | **0.11 µs** | 21.3 µs | **~87×** (linear) / **~14×** (tape) |
+| multi-path `EachDoc` | 50.9 µs (no tape) | **2.59 µs** (tape) | — | ~20x tape |
+| multi-path `Each` (stateless baseline) | 48.1 µs | — | — | — |
 
-**Takeaway:** the tape turns O(subtree) skipping into O(1) — still an
-order-of-magnitude gain on deep/scattered access, queries still zero-allocation.
+**Takeaway:** topology stride collapses deep indexed array access from O(N) to
+O(1) probes without requiring equal element sizes. Tape still wins on
+scattered multi-field work; together they erase the old "index is slow for deep
+arrays" story. Queries remain zero-allocation.
 
 ---
 
@@ -168,19 +174,33 @@ IndexTape remains the multi-query blowout (~1.4 µs).
 
 | Approach | time | allocs |
 | --- | --- | --- |
-| jseek `StreamNDJSONEach` (line split + multi-path, early exit) | **1.16 ms** | 0 B |
-| jseek `StreamNDJSON` + 3×`Get` | 1.30 ms | 0 B |
+| jseek `StreamNDJSONEach` (line split + multi-path, early exit) | **1.03–1.16 ms** | 0 B |
+| jseek `NewNDJSONDecoder` + `Reset` + `Paths.Each` | **1.04–1.09 ms** | **~51 B / 1 alloc** |
+| jseek `NewNDJSONDecoder` + `Paths.Each` (new each time) | **1.04–1.14 ms** | ~263 KB (bufio once) |
+| jseek `NewNDJSONDecoder` + 3×`Get` | **1.21–1.31 ms** | ~263 KB |
+| jseek `StreamNDJSON` + 3×`Get` | 1.26–1.30 ms | 0 B |
 | jseek `StreamBytes` + `EachKey` | 1.32 ms | 0 B |
-| jseek `StreamBytes` + 3×`Get` | 1.58 ms | 0 B |
-| gjson (pre-split lines + 3×`Get`) | 1.70 ms | 0 B |
-| jseek `Decoder` (io.Reader) | 2.18 ms | ~66 KB |
+| gjson (pre-split lines + 3×`Get`) | 1.61–1.70 ms | 0 B |
+| jseek `NewDecoder` (generic value framing) | ~2.0–2.2 ms | ~66 KB |
 
-**Takeaway:** the old NDJSON weak spot is closed. `StreamNDJSON` avoids a
-per-record `skipContainer` by SWAR newline scanning; `Paths.Each` stops once
-every requested path has been hit (skips trailing `trace_id`-sized junk). Net:
-**~32% faster than gjson** on the same shape, still zero allocation.
+**Takeaway:** in-memory and `io.Reader` NDJSON are both closed as weak spots.
+`StreamNDJSON` is the zero-alloc in-memory path; `NewNDJSONDecoder` uses
+line-mode `ReadSlice` so the Reader path matches StreamNDJSON within noise
+instead of paying full JSON value framing (~40% faster than generic
+`NewDecoder`). Multi-path early-exit still skips trailing junk keys.
 
-## Result 7:## Result 7: scan micro-throughput (string body)
+## Result 7:## Result 6b: Stage-1 index build
+
+| Fixture | time | notes |
+| --- | --- | --- |
+| large (~24 KB, 500 users) | **~61–67 µs** | short-string inline + NEON structural find |
+| GitHub-style (~60 KB, 200 issues) | **~30–33 µs** | same Stage-1 path |
+
+**Takeaway:** Stage-1 remains the gate for cold indexed/tape paths; NEON
+structural search and short unescaped string skips cut build cost without
+changing the Document API.
+
+## Result 7: scan micro-throughput (string body)
 
 4 KB quote-free string body (M4 Pro).
 
@@ -255,6 +275,8 @@ multi-path (Result 6).
    issue objects no longer disables strides; confirm+landing checks keep it safe.
 5. **`EachArrayFields`** — single member pass per array element for column harvest.
 6. **`StreamNDJSON` + `Paths` early-exit** — SWAR newline split; stop object walk when all paths hit.
+7. **Topology-constant array stride** — indexed deep `arr[N]` jumps by structural step when element topologies match (digit growth OK).
+8. **`NewNDJSONDecoder`** — line-mode Reader path for JSON Lines without full value framing.
 
 ## Discipline about the numbers
 

@@ -385,7 +385,8 @@ element, not the whole stream, and each element is a self-contained value you
 can run the full jseek API on (including `Index`).
 
 ```go
-dec := jseek.NewDecoder(resp.Body)
+dec := jseek.NewDecoder(resp.Body)       // JSON arrays / mixed values
+// dec := jseek.NewNDJSONDecoder(resp.Body) // JSON Lines / NDJSON (faster)
 err := dec.ForEach(func(elem []byte) error {
     name, _ := jseek.GetString(elem, "user", "name")
     // ... process one record; elem is valid only for this call
@@ -393,8 +394,9 @@ err := dec.ForEach(func(elem []byte) error {
 })
 ```
 
-`Decoder` auto-detects `[...]` arrays versus NDJSON / whitespace-separated
-values. Set `Decoder.MaxValue` to cap per-element size and reject hostile input
+`NewDecoder` auto-detects `[...]` arrays versus whitespace-separated values.
+For known NDJSON / JSON Lines over `io.Reader`, use `NewNDJSONDecoder` (line mode,
+no value-framing tax). Set `Decoder.MaxValue` to cap per-element size and reject hostile input
 with `ErrTooLarge`.
 
 When the whole input is already in memory, `StreamBytes` walks it with
@@ -407,7 +409,7 @@ jseek.StreamBytes(data, func(elem []byte) error {
 })
 ```
 
-For **JSON Lines / NDJSON** (one complete value per line), prefer
+For **JSON Lines / NDJSON** already in memory, prefer
 `StreamNDJSON` — it splits on newlines with a SWAR scanner instead of
 `skipContainer` per record. Pair with a compiled multi-path matcher and early
 exit once all fields are found:

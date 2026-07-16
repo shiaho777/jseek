@@ -56,7 +56,7 @@ structure instead of re-reading bytes.
 | `number.go` | allocation-free int/float/bool parsing |
 | `jseek.go` | stateless public API + shared `valueAt` extractor |
 | `index.go` | Stage-1 structural index builder (`Index`, `Document`, pool) |
-| `index_nav.go` | Stage-2 navigation over the index + `Document` getters |
+| `index_nav.go` | Stage-2 navigation over the index + topology-constant array stride + `Document` getters |
 | `index_tape.go` | optional O(1) skip-pointer tape for deep navigation |
 | `eachkey.go` | compiled multi-path matcher (`Paths`, `EachKey`) |
 | `eachkey_doc.go` | index/tape-aware multi-path matcher (`EachDoc`) |
@@ -67,7 +67,7 @@ structure instead of re-reading bytes.
 | `path.go` | dotted-path and JSON Pointer parsing |
 | `errors.go` | `PathError` with path/offset/type context |
 | `mutate.go` | `Set` / `Delete` |
-| `stream.go` | streaming `Decoder` (arrays + NDJSON) |
+| `stream.go` | streaming `Decoder` / `NewNDJSONDecoder` (arrays + line-mode NDJSON) |
 | `stream_bytes.go` | in-memory `StreamBytes` / `StreamNDJSON` / `StreamNDJSONEach` |
 | `bytes_unsafe.go` / `bytes_safe.go` | zero-copy vs safe string view (build tag) |
 
@@ -161,3 +161,16 @@ member walk, using a small active-key set rather than a full multi-path trie.
   the matrix). Fuzz **seed corpus** is required after tests; short generative
   fuzz is informational. A nightly workflow runs long generative campaigns.
   Concurrent same-ref runs cancel in progress so only the tip commit finishes.
+
+## Topology-constant array stride (indexed)
+
+Stateless navigation already has FASS equal-size object strides. The **indexed**
+path uses a different lever: when consecutive array elements share the same
+sequence of structural kinds (same topology), `findIndexIndexed` jumps by the
+measured structural step instead of visiting every element. Validation uses
+mid/quartile topology probes and first-key checks. Because the step is in the
+structural array — not in raw bytes — digit growth and other equal-topology,
+unequal-size layouts still accelerate. Combined with the skip tape this makes
+deep `users[N]` index queries competitive with (and often faster than) cold
+stateless FASS.
+
