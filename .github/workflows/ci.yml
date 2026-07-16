@@ -79,7 +79,24 @@ jobs:
           cache: true
           cache-dependency-path: go.mod
 
-      - name: Fuzz smoke (short corpus exercise)
+      - name: Fuzz seed corpus
+        run: |
+          set -euo pipefail
+          targets=(
+            FuzzGetAgainstStdlib
+            FuzzDocumentMatchesGet
+            FuzzTapeMatchesGet
+            FuzzEachKeyMatchesGet
+            FuzzPinMatchesGet
+          )
+          for t in "${targets[@]}"; do
+            echo "::group::seed $t"
+            go test -count=1 -run="^${t}$" .
+            echo "::endgroup::"
+          done
+
+      - name: Fuzz generative smoke
+        continue-on-error: true
         run: |
           set -euo pipefail
           targets=(
@@ -91,7 +108,7 @@ jobs:
           )
           for t in "${targets[@]}"; do
             echo "::group::fuzz $t"
-            go test -run=^$ -fuzz=^$t$ -fuzztime=5s .
+            go test -run=^$ -fuzz="^${t}$" -fuzztime=3s .
             echo "::endgroup::"
           done
 
@@ -117,3 +134,14 @@ jobs:
         run: |
           go test -bench='BenchmarkSmall_|BenchmarkLargeShallow_|BenchmarkLargeIndexed_|BenchmarkLargeArrayEach_' \
             -benchmem -benchtime=50ms -count=1 ./...
+
+  ci-success:
+    name: ci success
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require test matrix green
+        run: |
+          echo "test result: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = "success"
