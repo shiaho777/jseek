@@ -397,13 +397,27 @@ err := dec.ForEach(func(elem []byte) error {
 values. Set `Decoder.MaxValue` to cap per-element size and reject hostile input
 with `ErrTooLarge`.
 
-When the whole input is already in memory, `StreamBytes` walks it directly with
-**zero allocation and zero copy** (each element aliases the input), which is
-faster than the buffered reader:
+When the whole input is already in memory, `StreamBytes` walks it with
+**zero allocation and zero copy** (each element aliases the input):
 
 ```go
 jseek.StreamBytes(data, func(elem []byte) error {
     id, _ := jseek.GetInt(elem, "id")
+    return nil
+})
+```
+
+For **JSON Lines / NDJSON** (one complete value per line), prefer
+`StreamNDJSON` — it splits on newlines with a SWAR scanner instead of
+`skipContainer` per record. Pair with a compiled multi-path matcher and early
+exit once all fields are found:
+
+```go
+q := jseek.CompileStrings(
+    []string{"latency_ms"}, []string{"status"}, []string{"client", "region"},
+)
+_ = jseek.StreamNDJSONEach(data, q, func(idx int, value []byte, vt jseek.ValueType, err error) error {
+    // one member pass per line; stops after the last needed key
     return nil
 })
 ```
@@ -524,7 +538,7 @@ sibling-field `GetFields`/`EachField`, the "index once, query many" engine
 (`Index`/`IndexTape`), `Pin` and columnar `Transpose` for repeated access,
 multi-path `EachKey`/`GetMany`, generic accessors, `Set`/`Delete` mutation,
 dotted-path and JSON Pointer syntaxes, contextual errors, and memory-bounded
-streaming (`Decoder`/`StreamBytes`). Navigation includes FASS equal-size array
+streaming (`Decoder`/`StreamBytes`/`StreamNDJSON`). Navigation includes FASS equal-size array
 strides; scanning includes portable SWAR plus shipped AVX2/NEON kernels (opt out
 with `-tags purego`).
 
@@ -568,6 +582,6 @@ Representative results on an Apple M4 Pro (lower is better):
 
 `jseek` leads the lazy class on single-field, multi-path, deep homogeneous arrays
 (FASS), and IndexTape reuse — all **zero allocation**. Deep `users[250]` (~3 µs) and GitHub-style issue arrays (~5.6 µs cold) are both
-ahead of sonic's arm64 path. **It is not universally fastest:** tiny flat NDJSON
-field-by-field can still favor gjson by single-digit percent — see
+ahead of sonic's arm64 path. NDJSON log harvest with `StreamNDJSONEach` leads
+gjson on the former weak spot (~1.16 ms vs ~1.70 ms / 5000 lines). See
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for full boundaries and methodology.

@@ -68,6 +68,7 @@ structure instead of re-reading bytes.
 | `errors.go` | `PathError` with path/offset/type context |
 | `mutate.go` | `Set` / `Delete` |
 | `stream.go` | streaming `Decoder` (arrays + NDJSON) |
+| `stream_bytes.go` | in-memory `StreamBytes` / `StreamNDJSON` / `StreamNDJSONEach` |
 | `bytes_unsafe.go` / `bytes_safe.go` | zero-copy vs safe string view (build tag) |
 
 ## Two scan engines, one extractor

@@ -161,25 +161,26 @@ IndexTape remains the multi-query blowout (~1.4 µs).
 
 ---
 
-## Result 6: real-world — NDJSON log stream (jseek's weak spot, recorded honestly)
+## Result 6: real-world — NDJSON log stream
 
-5000 flat ~250 B records, all in memory, reading 3 fields per record
-field-by-field. (Numbers from the previous calibration pass; re-run
-`BenchmarkNDJSON_*` after major scanner changes.)
+5000 flat access-log records (~250 B each), read `latency_ms`, `status`, and
+`client.region` per line.
 
 | Approach | time | allocs |
 | --- | --- | --- |
-| gjson (per-line Get) | **1.81 ms** | 0 B |
-| jseek `StreamBytes` + single-pass `EachKey` | 1.94 ms | 0 B |
-| jseek `StreamBytes` + 3× `Get` | 2.23 ms | 0 B |
+| jseek `StreamNDJSONEach` (line split + multi-path, early exit) | **1.16 ms** | 0 B |
+| jseek `StreamNDJSON` + 3×`Get` | 1.30 ms | 0 B |
+| jseek `StreamBytes` + `EachKey` | 1.32 ms | 0 B |
+| jseek `StreamBytes` + 3×`Get` | 1.58 ms | 0 B |
+| gjson (pre-split lines + 3×`Get`) | 1.70 ms | 0 B |
+| jseek `Decoder` (io.Reader) | 2.18 ms | ~66 KB |
 
-**Takeaway:** tiny flat records with no array-stride opportunity are near the
-information-theoretic floor; gjson can still edge this shape by single-digit
-percent. Not the design target for FASS / IndexTape.
+**Takeaway:** the old NDJSON weak spot is closed. `StreamNDJSON` avoids a
+per-record `skipContainer` by SWAR newline scanning; `Paths.Each` stops once
+every requested path has been hit (skips trailing `trace_id`-sized junk). Net:
+**~32% faster than gjson** on the same shape, still zero allocation.
 
----
-
-## Result 7: scan micro-throughput (string body)
+## Result 7:## Result 7: scan micro-throughput (string body)
 
 4 KB quote-free string body (M4 Pro).
 
@@ -219,9 +220,8 @@ than JIT). Even so:
 
 **Updated takeaway (2026-07-16):** FASS + confirmed equal-size strides closed the
 old deep-array and GitHub cold losses vs sonic arm64 on homogeneous issue/
-user arrays — including elements that embed nested object-arrays. Remaining
-lazy losses are tiny flat NDJSON field-by-field shapes (Result 6), not nested
-API documents.
+user arrays — including elements that embed nested object-arrays. The former NDJSON weak spot is now a lead via `StreamNDJSON` + early-exit
+multi-path (Result 6).
 
 ### Amortized access (IndexTape reused)
 
@@ -254,6 +254,7 @@ API documents.
 4. **Drop the nested-object-array ban on FASS** — `labels:[{...}]` inside equal-size
    issue objects no longer disables strides; confirm+landing checks keep it safe.
 5. **`EachArrayFields`** — single member pass per array element for column harvest.
+6. **`StreamNDJSON` + `Paths` early-exit** — SWAR newline split; stop object walk when all paths hit.
 
 ## Discipline about the numbers
 
