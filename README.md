@@ -556,7 +556,7 @@ Representative results on an Apple M4 Pro (lower is better):
 | --- | --- | --- | --- |
 | Small payload, 4 fields | **128 ns** / 0 B | 286 ns / 0 B | 359 ns / 144 B |
 | Large doc, shallow fields | **93 ns** / 0 B | 122 ns / 0 B | 156 ns / 16 B |
-| Large doc, deep indexed (2 Gets) | **3.47 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B |
+| Large doc, deep indexed (2 Gets) | **3.0 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B |
 | Same via `GetFields` | **1.79 µs** / 0 B | — | — |
 | Large doc, full ArrayEach + 2 fields/elem | **83 µs** / 0 B | 208 µs / 0 B | 276 µs / 188 KB |
 | Large doc, `EachArrayFields` (2 fields/elem) | **76 µs** / 0 B | — | — |
@@ -564,6 +564,7 @@ Representative results on an Apple M4 Pro (lower is better):
 | Stateless 12 fields (FASS) | **86 µs** / 0 B | — | 469 µs / 1.2 KB |
 | IndexTape, 12 fields | **5.7 µs** / 0 B | — | — |
 | Deep access + tape | **1.58 µs** / 0 B | — | — |
+| GitHub 7 fields (cold FASS) | **5.6 µs** / 0 B | 137 µs / 0 B | 50 µs / 664 B |
 
 `jseek` leads the lazy class on single-field, multi-path, deep homogeneous arrays
 (FASS), and IndexTape reuse — all **zero allocation**. Deep `users[250]` (~3 µs) and GitHub-style issue arrays (~5.6 µs cold) are both

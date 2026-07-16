@@ -228,7 +228,7 @@ API documents.
 | Scenario | jseek IndexTape | sonic cold | jseek advantage |
 | --- | --- | --- | --- |
 | 12 scattered fields | **5.7 µs** / 0 B | 119 µs | **~21×** |
-| GitHub 7 nested fields | **1.54 µs** / 0 B | 15.5 µs | **~10×** |
+| GitHub 7 nested fields | **1.42 µs** / 0 B | 14.3 µs | **~10×** |
 | multi-path `EachDoc` + tape | **2.59 µs** / 0 B | 119 µs | **~46×** |
 
 ### Bottom line
