@@ -16,15 +16,23 @@ func isWhitespace(c byte) bool {
 // skipWhitespace returns the index of the first non-whitespace byte at or after
 // i. It may return len(data).
 func skipWhitespace(data []byte, i int) int {
-	for i < len(data) {
-		switch data[i] {
-		case ' ', '\t', '\n', '\r':
-			i++
-		default:
-			return i
-		}
+	n := len(data)
+	if i >= n {
+		return i
 	}
-	return i
+	c := data[i]
+	if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+		return i
+	}
+	i++
+	if i >= n {
+		return i
+	}
+	c = data[i]
+	if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+		return i
+	}
+	return indexSkipWhitespace(data, i)
 }
 
 // classify returns the ValueType of the value beginning at data[i], which must
@@ -58,21 +66,7 @@ func classify(data []byte, i int) ValueType {
 // backslash, so unescaped string content — the bulk of real JSON — is traversed
 // at register-parallel speed rather than one byte per iteration.
 func skipString(data []byte, i int) (int, bool) {
-	// data[i] is the opening quote.
-	i++
-	n := len(data)
-	for i < n {
-		j := indexQuoteOrBackslash(data, i)
-		if j < 0 {
-			return n, false
-		}
-		if data[j] == '"' {
-			return j + 1, true
-		}
-		// data[j] == '\\': skip the escaped byte and resume scanning.
-		i = j + 2
-	}
-	return i, false
+	return skipStringBody(data, i+1)
 }
 
 // skipNumber returns the index just past a number beginning at data[i]. It is
@@ -96,13 +90,37 @@ func skipNumber(data []byte, i int) (int, bool) {
 // skipLiteral checks for the literal word (true/false/null) at data[i] and
 // returns the index just past it.
 func skipLiteral(data []byte, i int, word string) (int, bool) {
-	if i+len(word) > len(data) {
+	n := len(word)
+	if i+n > len(data) {
 		return i, false
 	}
-	if string(data[i:i+len(word)]) != word {
+	for k := 0; k < n; k++ {
+		if data[i+k] != word[k] {
+			return i, false
+		}
+	}
+	return i + n, true
+}
+
+func skipTrue(data []byte, i int) (int, bool) {
+	if i+4 > len(data) || data[i+1] != 'r' || data[i+2] != 'u' || data[i+3] != 'e' {
 		return i, false
 	}
-	return i + len(word), true
+	return i + 4, true
+}
+
+func skipFalse(data []byte, i int) (int, bool) {
+	if i+5 > len(data) || data[i+1] != 'a' || data[i+2] != 'l' || data[i+3] != 's' || data[i+4] != 'e' {
+		return i, false
+	}
+	return i + 5, true
+}
+
+func skipNull(data []byte, i int) (int, bool) {
+	if i+4 > len(data) || data[i+1] != 'u' || data[i+2] != 'l' || data[i+3] != 'l' {
+		return i, false
+	}
+	return i + 4, true
 }
 
 // skipValue skips the entire JSON value (including any nested object/array
@@ -121,11 +139,11 @@ func skipValue(data []byte, i int) (int, bool) {
 	case '{', '[':
 		return skipContainer(data, i)
 	case 't':
-		return skipLiteral(data, i, "true")
+		return skipTrue(data, i)
 	case 'f':
-		return skipLiteral(data, i, "false")
+		return skipFalse(data, i)
 	case 'n':
-		return skipLiteral(data, i, "null")
+		return skipNull(data, i)
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		return skipNumber(data, i)
 	default:
@@ -153,42 +171,6 @@ func skipValue(data []byte, i int) (int, bool) {
 // wide scanner pays its per-call setup without skipping a meaningful run. The
 // byte-at-a-time gap handling below wins whenever structural bytes are dense,
 // which is the common case; string *bodies* (the long runs) already use SWAR.
-func skipContainer(data []byte, i int) (int, bool) {
-	n := len(data)
-	depth := 0
-	for i < n {
-		switch data[i] {
-		case '"':
-			// Inline the string-body skip (skipString) to avoid a call frame in
-			// the hottest loop: scan for the closing quote with the SWAR
-			// quote/backslash scanner, stepping over escaped bytes.
-			i++
-			for {
-				j := indexQuoteOrBackslash(data, i)
-				if j < 0 {
-					return n, false
-				}
-				if data[j] == '"' {
-					i = j + 1
-					break
-				}
-				i = j + 2 // escaped byte
-			}
-		case '{', '[':
-			depth++
-			i++
-		case '}', ']':
-			depth--
-			i++
-			if depth == 0 {
-				return i, true
-			}
-		default:
-			i++
-		}
-	}
-	return i, false
-}
 
 // skipObject skips a full object beginning at data[i] == '{'. It delegates to
 // the flat skipContainer scan; on valid JSON the end offset is identical to a
@@ -232,16 +214,16 @@ func valueBounds(data []byte, i int) (start, end int, vt ValueType, ok bool) {
 		e, ok = skipNumber(data, i)
 		return i, e, Number, ok
 	case Boolean:
-		word := "true"
-		if data[i] == 'f' {
-			word = "false"
-		}
 		var e int
-		e, ok = skipLiteral(data, i, word)
+		if data[i] == 'f' {
+			e, ok = skipFalse(data, i)
+		} else {
+			e, ok = skipTrue(data, i)
+		}
 		return i, e, Boolean, ok
 	case Null:
 		var e int
-		e, ok = skipLiteral(data, i, "null")
+		e, ok = skipNull(data, i)
 		return i, e, Null, ok
 	default:
 		return i, i, NotExist, false
