@@ -112,11 +112,11 @@ gate that catches `$0-N` / `ret` vs `ret1` mistakes).
 ### Array strides (FASS)
 
 `findIndexObjectStride` in `navigate.go` accelerates minified homogeneous object
-arrays. Pure endpoint arithmetic only runs after **two** consecutive elements
-agree on `skipContainer` length (`strideConfirmed`); bulk/direct landings call
-`skipContainer` again. That keeps the fast path for real API-list payloads while
-preventing false index matches on malformed siblings that merely place a `}` at
-the expected offset.
+arrays — including elements that embed nested objects/arrays (GitHub-style
+`issues[].labels[]`). Pure endpoint arithmetic only runs after **two**
+consecutive elements agree on `skipContainer` length (`strideConfirmed`);
+bulk/direct landings call `skipContainer` again. Nested structure is allowed;
+safety is confirm+landing validation, not a ban on nested object-arrays.
 
 ### Sibling multi-key scan
 
@@ -139,8 +139,8 @@ member walk, using a small active-key set rather than a full multi-path trie.
    but need not match any particular library. Fast-path array strides over
    homogeneous object elements (FASS equal-size jumps in `navigate.go`) only
    activate after two consecutive `skipContainer` lengths match, and direct
-   landings are re-validated — endpoint shape alone is never enough to accept
-   an index.
+   landings are re-validated — nested object-arrays inside elements are allowed;
+   endpoint shape alone is never enough to accept an index.
 6. **The indexed engine is correct at any document size.** The structural index
    packs a 29-bit offset, so documents above 512 MiB cannot be indexed; rather
    than truncate the index (which would silently mis-answer queries into the

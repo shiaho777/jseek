@@ -147,16 +147,17 @@ order-of-magnitude gain on deep/scattered access, queries still zero-allocation.
 
 | Approach | time | allocs |
 | --- | --- | --- |
-| jseek IndexTape (reused) | **1.54 µs** | 0 B |
-| jseek stateless | 47.4 µs | 0 B |
-| jseek per-request (pooled) | 55.4 µs | ~0–39 B |
-| sonic (arm64 cold) | **15.5 µs** | 328 B |
-| gjson GetMany | 60.3 µs | 664 B |
-| jsonparser | 154 µs | 0 B |
+| jseek IndexTape (reused) | **1.42 µs** | 0 B |
+| jseek stateless (FASS on nested issues) | **5.61 µs** | 0 B |
+| sonic (arm64 cold) | 14.3 µs | 331 B |
+| gjson GetMany | 50.2 µs | 664 B |
+| jsonparser | 137 µs | 0 B |
 
-**Takeaway:** reused IndexTape remains a blowout (**~39× vs gjson**). Cold
-stateless still trails sonic on this nested shape (sonic ~3×); per-request
-pooled stays competitive with gjson at near-zero alloc.
+**Takeaway:** FASS now applies to homogeneous object arrays **even when elements
+contain nested object-arrays** (safety is the two-element `skipContainer`
+confirm + landing re-validate, not a structural ban). Cold stateless GitHub is
+**~2.5× faster than sonic arm64** and **~9× faster than gjson**, still 0 B.
+IndexTape remains the multi-query blowout (~1.4 µs).
 
 ---
 
@@ -214,13 +215,13 @@ than JIT). Even so:
 | Large, shallow 2 fields | **93 ns** / 0 B | ~350 ns / 81 B | **jseek ~3.8×** |
 | Large, deep indexed 2 fields | **3.05 µs** / 0 B | 22.7 µs / 90 B | **jseek ~6.5×** (FASS) |
 | 12 scattered fields | **86 µs** / 0 B | 119 µs / 572 B | **jseek ~1.4×** |
-| GitHub 7 nested fields | 47.4 µs / 0 B | **15.5 µs** / 328 B | **sonic ~3×** |
+| GitHub 7 nested fields | **5.61 µs** / 0 B | 14.3 µs / 331 B | **jseek ~2.5×** |
 
 **Updated takeaway (2026-07-16):** FASS + confirmed equal-size strides closed the
-old "deep array index loses to sonic" hole on the large homogeneous-users
-fixture. The remaining cold loss is **deeply nested, non-uniform** documents
-(GitHub-style), where object shapes do not admit fixed strides and sonic's
-single pass still pays off.
+old deep-array and GitHub cold losses vs sonic arm64 on homogeneous issue/
+user arrays — including elements that embed nested object-arrays. Remaining
+lazy losses are tiny flat NDJSON field-by-field shapes (Result 6), not nested
+API documents.
 
 ### Amortized access (IndexTape reused)
 
@@ -236,7 +237,7 @@ single pass still pays off.
 | --- | --- |
 | Small / shallow cold | jseek leads, 0 alloc |
 | Homogeneous deep array cold | **jseek leads (FASS), 0 alloc** |
-| Nested non-uniform cold | sonic still leads ~3× |
+| Nested homogeneous cold (GitHub issues) | **jseek leads ~2.5×** |
 | IndexTape reuse | **jseek 10–46×, 0 alloc** |
 
 ---
@@ -250,6 +251,9 @@ single pass still pays off.
    deep-index CPU).
 3. **`EachKey` array edges use `findIndex` / relative `findIndexObjectStride`**
    — multi-path no longer walks every preceding array element with `skipValue`.
+4. **Drop the nested-object-array ban on FASS** — `labels:[{...}]` inside equal-size
+   issue objects no longer disables strides; confirm+landing checks keep it safe.
+5. **`EachArrayFields`** — single member pass per array element for column harvest.
 
 ## Discipline about the numbers
 

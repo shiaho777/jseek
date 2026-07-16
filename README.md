@@ -566,8 +566,7 @@ Representative results on an Apple M4 Pro (lower is better):
 | Deep access + tape | **1.58 µs** / 0 B | — | — |
 
 `jseek` leads the lazy class on single-field, multi-path, deep homogeneous arrays
-(FASS), and IndexTape reuse — all **zero allocation**. Deep `users[250]` is also
-ahead of sonic's arm64 path (~22.7 µs). **It is not universally fastest:** tiny
-flat NDJSON field-by-field and some nested non-uniform cold shapes can still
-favor gjson/sonic — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
-honest boundaries, methodology, and how to reproduce.
+(FASS), and IndexTape reuse — all **zero allocation**. Deep `users[250]` (~3 µs) and GitHub-style issue arrays (~5.6 µs cold) are both
+ahead of sonic's arm64 path. **It is not universally fastest:** tiny flat NDJSON
+field-by-field can still favor gjson by single-digit percent — see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for full boundaries and methodology.
