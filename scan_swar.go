@@ -93,7 +93,6 @@ func indexQuoteOrBackslashSWAR16(data []byte, i int) int {
 	return indexQuoteOrBackslashSWAR(data, i)
 }
 
-
 func indexSkipWhitespaceSWAR(data []byte, i int) int {
 	n := len(data)
 	for i+8 <= n {
@@ -137,7 +136,7 @@ func structuralOrQuoteMask(v uint64) uint64 {
 
 func indexStructuralOrQuoteSWAR(data []byte, i int) int {
 	n := len(data)
-	for i+16 <= n {
+	for i+32 <= n {
 		v0 := load64(data, i)
 		m0 := structuralOrQuoteMask(v0)
 		if m0 != 0 {
@@ -148,7 +147,17 @@ func indexStructuralOrQuoteSWAR(data []byte, i int) int {
 		if m1 != 0 {
 			return i + 8 + bits.TrailingZeros64(m1)>>3
 		}
-		i += 16
+		v2 := load64(data, i+16)
+		m2 := structuralOrQuoteMask(v2)
+		if m2 != 0 {
+			return i + 16 + bits.TrailingZeros64(m2)>>3
+		}
+		v3 := load64(data, i+24)
+		m3 := structuralOrQuoteMask(v3)
+		if m3 != 0 {
+			return i + 24 + bits.TrailingZeros64(m3)>>3
+		}
+		i += 32
 	}
 	for i+8 <= n {
 		v := load64(data, i)
@@ -166,7 +175,6 @@ func indexStructuralOrQuoteSWAR(data []byte, i int) int {
 	}
 	return -1
 }
-
 func containerSpecialMask(v uint64) uint64 {
 	m := zeroByteMask(v ^ broadcast('"'))
 	m |= zeroByteMask(v ^ broadcast('{'))

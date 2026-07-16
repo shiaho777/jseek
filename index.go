@@ -231,41 +231,30 @@ func indexStructurals(data []byte, out []uint32) []uint32 {
 	i := 0
 	for i < n {
 		c := data[i]
-		switch c {
-		case '"':
-			out = append(out, packEntry(kQuote, uint32(i)))
-			end, ok := skipString(data, i)
-			if !ok {
-				return out
+		sk := structuralKind[c]
+		if sk != 0 {
+			if sk == kQuote {
+				out = append(out, packEntry(kQuote, uint32(i)))
+				end, ok := skipString(data, i)
+				if !ok {
+					return out
+				}
+				i = end
+				continue
 			}
-			i = end
-		case '{':
-			out = append(out, packEntry(kObrace, uint32(i)))
+			out = append(out, packEntry(sk, uint32(i)))
 			i++
-		case '}':
-			out = append(out, packEntry(kCbrace, uint32(i)))
-			i++
-		case '[':
-			out = append(out, packEntry(kObrack, uint32(i)))
-			i++
-		case ']':
-			out = append(out, packEntry(kCbrack, uint32(i)))
-			i++
-		case ':':
-			out = append(out, packEntry(kColon, uint32(i)))
-			i++
-		case ',':
-			out = append(out, packEntry(kComma, uint32(i)))
-			i++
-		case ' ', '\t', '\n', '\r':
-			i = indexSkipWhitespace(data, i)
-		default:
-			j := indexStructuralOrQuote(data, i+1)
-			if j < 0 || j >= n {
-				return out
-			}
-			i = j
+			continue
 		}
+		if c == ' ' || c == 9 || c == 10 || c == 13 {
+			i = indexSkipWhitespace(data, i)
+			continue
+		}
+		j := indexStructuralOrQuote(data, i+1)
+		if j < 0 || j >= n {
+			return out
+		}
+		i = j
 	}
 	return out
 }

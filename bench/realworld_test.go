@@ -129,6 +129,59 @@ var ndjsonFixture = makeNDJSONLogs(5000)
 
 // Realistic stream processing: for each log line, extract status, latency, and a
 // nested client field. This is the canonical "tail and aggregate" workload.
+
+func BenchmarkNDJSON_JseekNDJSONDecoder(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var totalLatency int64
+		var errs int
+		dec := jseek.NewNDJSONDecoder(bytes.NewReader(ndjsonFixture))
+		_ = dec.ForEach(func(elem []byte) error {
+			lat, _ := jseek.GetInt(elem, "latency_ms")
+			totalLatency += lat
+			if st, _ := jseek.GetInt(elem, "status"); st >= 500 {
+				errs++
+			}
+			_, _ = jseek.GetStringUnsafe(elem, "client", "region")
+			return nil
+		})
+		_ = totalLatency
+		_ = errs
+	}
+}
+
+func BenchmarkNDJSON_JseekNDJSONDecoderEach(b *testing.B) {
+	q := jseek.CompileStrings(
+		[]string{"latency_ms"},
+		[]string{"status"},
+		[]string{"client", "region"},
+	)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var totalLatency int64
+		var errs int
+		dec := jseek.NewNDJSONDecoder(bytes.NewReader(ndjsonFixture))
+		_ = dec.ForEach(func(elem []byte) error {
+			q.Each(elem, func(idx int, value []byte, vt jseek.ValueType, err error) {
+				switch idx {
+				case 0:
+					if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok {
+						totalLatency += n
+					}
+				case 1:
+					if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok && n >= 500 {
+						errs++
+					}
+				}
+			})
+			return nil
+		})
+		_ = totalLatency
+		_ = errs
+	}
+}
+
 func BenchmarkNDJSON_JseekStream(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

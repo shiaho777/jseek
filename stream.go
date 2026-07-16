@@ -27,23 +27,29 @@ var ErrTooLarge = errors.New("jseek: value exceeds maximum size")
 // use.
 type Decoder struct {
 	r   *bufio.Reader
-	buf []byte // holds the current element bytes (reused across calls)
+	buf []byte
 
-	// MaxValue caps the size in bytes of a single element. Zero means the
-	// default (64 MiB). Set before the first Next/ForEach call.
 	MaxValue int
 
-	started bool // have we consumed the optional leading '['?
-	inArray bool // are we inside a top-level array?
-	done    bool // stream exhausted
-	err     error
+	started  bool
+	inArray  bool
+	done     bool
+	err      error
+	lineMode bool
 }
 
 const defaultMaxValue = 64 << 20 // 64 MiB
 
-// NewDecoder returns a Decoder reading from r.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{r: bufio.NewReaderSize(r, 64<<10)}
+}
+
+func NewNDJSONDecoder(r io.Reader) *Decoder {
+	return &Decoder{
+		r:        bufio.NewReaderSize(r, 256<<10),
+		lineMode: true,
+		started:  true,
+	}
 }
 
 func (d *Decoder) maxValue() int {
@@ -77,6 +83,9 @@ func (d *Decoder) Next() ([]byte, error) {
 	}
 	if d.done {
 		return nil, io.EOF
+	}
+	if d.lineMode {
+		return d.nextLine()
 	}
 
 	if !d.started {
@@ -147,6 +156,68 @@ func (d *Decoder) Next() ([]byte, error) {
 
 // readValue reads exactly one complete JSON value from the reader into d.buf,
 // tracking string state and brace/bracket depth so it stops at the value's end.
+func trimNDJSONLine(b []byte) []byte {
+	i := 0
+	for i < len(b) {
+		c := b[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		break
+	}
+	j := len(b)
+	for j > i {
+		c := b[j-1]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			j--
+			continue
+		}
+		break
+	}
+	return b[i:j]
+}
+
+func (d *Decoder) nextLine() ([]byte, error) {
+	max := d.maxValue()
+	for {
+		d.buf = d.buf[:0]
+		for {
+			chunk, err := d.r.ReadSlice('\n')
+			d.buf = append(d.buf, chunk...)
+			if len(d.buf) > max {
+				d.err = ErrTooLarge
+				return nil, ErrTooLarge
+			}
+			if err == nil {
+				line := trimNDJSONLine(d.buf)
+				if len(line) == 0 {
+					break
+				}
+				d.buf = append(d.buf[:0], line...)
+				return d.buf, nil
+			}
+			if err == io.EOF {
+				d.done = true
+				line := trimNDJSONLine(d.buf)
+				if len(line) == 0 {
+					return nil, io.EOF
+				}
+				d.buf = append(d.buf[:0], line...)
+				return d.buf, nil
+			}
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			d.err = err
+			return nil, err
+		}
+		if d.done {
+			return nil, io.EOF
+		}
+	}
+}
+
 func (d *Decoder) readValue() ([]byte, error) {
 	d.buf = d.buf[:0]
 	max := d.maxValue()
