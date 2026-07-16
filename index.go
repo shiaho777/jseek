@@ -235,6 +235,10 @@ func indexStructurals(data []byte, out []uint32) []uint32 {
 		if sk != 0 {
 			if sk == kQuote {
 				out = append(out, packEntry(kQuote, uint32(i)))
+				if end := skipStringShort(data, i); end >= 0 {
+					i = end
+					continue
+				}
 				end, ok := skipString(data, i)
 				if !ok {
 					return out

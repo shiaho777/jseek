@@ -216,3 +216,40 @@ func indexContainerSpecial(data []byte, i int) int {
 	}
 	return -1
 }
+
+func skipStringShort(data []byte, i int) int {
+	n := len(data)
+	body := i + 1
+	if body >= n {
+		return -1
+	}
+	if body+8 <= n {
+		v := load64(data, body)
+		quote := broadcast('"')
+		back := broadcast('\\')
+		qm := zeroByteMask(v ^ quote)
+		bm := zeroByteMask(v ^ back)
+		if qm != 0 {
+			qpos := bits.TrailingZeros64(qm) >> 3
+			if bm == 0 || bits.TrailingZeros64(bm)>>3 > qpos {
+				return body + qpos + 1
+			}
+			return -1
+		}
+		if bm != 0 {
+			return -1
+		}
+		if body+16 <= n {
+			v2 := load64(data, body+8)
+			qm2 := zeroByteMask(v2 ^ quote)
+			bm2 := zeroByteMask(v2 ^ back)
+			if qm2 != 0 {
+				qpos := bits.TrailingZeros64(qm2) >> 3
+				if bm2 == 0 || bits.TrailingZeros64(bm2)>>3 > qpos {
+					return body + 8 + qpos + 1
+				}
+			}
+		}
+	}
+	return -1
+}
