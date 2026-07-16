@@ -146,8 +146,8 @@ Measured on the 24 KB document (Apple M4 Pro, reused index, 0 allocs/query):
 
 | Query | linear skip | with tape | speedup |
 | --- | --- | --- | --- |
-| 12 scattered fields | 130 µs | 5.0 µs | **~26x** |
-| deep `users[499].name` | 24.6 µs | 1.3 µs | **~18x** |
+| 12 scattered fields | 130 µs | 5.7 µs | **~23x** |
+| deep `users[499].name` | 24.3 µs | 1.58 µs | **~15x** |
 
 The tape costs one extra `uint32` per structural (it roughly doubles the
 transient index), released with the `Document`. It is opt-in so plain `Index`
@@ -158,10 +158,10 @@ document, reading 12 scattered fields (Apple M4 Pro):
 
 | Approach | time | allocs |
 | --- | --- | --- |
-| stateless `Get` ×12 (re-scan each) | 398 µs | 0 |
-| `IndexPooled` + 12 queries | 165 µs | 2 (pooled) |
-| reused index, 12 queries | **89 µs** | **0** |
-| gjson `GetManyBytes` | 509 µs | 13 |
+| stateless `Get` ×12 (FASS, re-scan each) | **86 µs** | **0** |
+| reused index, 12 queries | 130 µs | 0 |
+| IndexTape, 12 queries | **5.7 µs** | **0** |
+| gjson `GetManyBytes` | 469 µs | 13 |
 
 The more fields you read per document, the larger the win. Stage-1 scanning
 uses the same SWAR/SIMD core as the rest of the package, so string-heavy
@@ -253,9 +253,9 @@ Measured on the 24 KB document (6 scattered paths, reused index, 0 allocs):
 
 | Engine | time | vs stateless |
 | --- | --- | --- |
-| `Each` (stateless, re-scan) | 157 µs | 1x |
-| `EachDoc` (indexed, no tape) | 53 µs | ~3x |
-| `EachDoc` (indexed + tape) | **2.6 µs** | **~61x** |
+| `Each` (stateless + FASS) | 48 µs | 1x |
+| `EachDoc` (indexed, no tape) | 51 µs | ~1x |
+| `EachDoc` (indexed + tape) | **2.6 µs** | **~18x** |
 
 For ordered, typed results, `GetMany` returns a `Result` per path in a single
 pass:
@@ -534,17 +534,19 @@ Representative results on an Apple M4 Pro (lower is better):
 
 | Scenario | jseek | jsonparser | gjson |
 | --- | --- | --- | --- |
-| Small payload, 4 fields | **145 ns** / 0 B | 276 ns / 0 B | 349 ns / 144 B |
-| Large doc, shallow fields | **106 ns** / 0 B | 116 ns / 0 B | 158 ns / 16 B |
-| Large doc, deep indexed field | **70 µs** / 0 B | 238 µs / 0 B | 88 µs / 16 B |
-| Large doc, full ArrayEach | **131 µs** / 0 B | 211 µs / 0 B | 289 µs / 184 KB |
-| Multi-path (6 fields, 1 pass) | **148 µs** / 0 B | — | 194 µs / 536 B |
-| Index reused, 12 fields | **120 µs** / 0 B | — | 460 µs / 1.2 KB |
-| Deep access + tape | **1.6 µs** / 0 B | — | — |
+| Small payload, 4 fields | **128 ns** / 0 B | 286 ns / 0 B | 359 ns / 144 B |
+| Large doc, shallow fields | **93 ns** / 0 B | 122 ns / 0 B | 156 ns / 16 B |
+| Large doc, deep indexed (2 Gets) | **3.47 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B |
+| Same via `GetFields` | **1.79 µs** / 0 B | — | — |
+| Large doc, full ArrayEach | **85 µs** / 0 B | 213 µs / 0 B | 298 µs / 188 KB |
+| Multi-path (6 fields, `EachKey`) | **46.7 µs** / 0 B | — | 196 µs / 536 B |
+| Stateless 12 fields (FASS) | **86 µs** / 0 B | — | 469 µs / 1.2 KB |
+| IndexTape, 12 fields | **5.7 µs** / 0 B | — | — |
+| Deep access + tape | **1.58 µs** / 0 B | — | — |
 
-`jseek` leads on single-field, multi-path, and (especially) indexed/reused access,
-and is zero-allocation across all of them. **It is not universally fastest:** on
-tiny in-memory NDJSON records read field-by-field, `gjson` is ~7.5% faster — see
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full results including where `jseek`
-loses, the methodology, and how to reproduce. Numbers vary by machine and
-payload; verify on your own hardware and data.
+`jseek` leads the lazy class on single-field, multi-path, deep homogeneous arrays
+(FASS), and IndexTape reuse — all **zero allocation**. Deep `users[250]` is also
+ahead of sonic's arm64 path (~22.7 µs). **It is not universally fastest:** tiny
+flat NDJSON field-by-field and some nested non-uniform cold shapes can still
+favor gjson/sonic — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
+honest boundaries, methodology, and how to reproduce.
