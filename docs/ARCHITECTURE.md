@@ -138,7 +138,11 @@ honest result is why SIMD is positioned as optional, not as a headline.
 4. **Correctness is differential.** New features that interpret JSON get a fuzz
    test against `encoding/json` or against an existing jseek path.
 5. **Contract = valid UTF-8 JSON.** Behavior on malformed input must not panic,
-   but need not match any particular library.
+   but need not match any particular library. Fast-path array strides over
+   homogeneous object elements (FASS equal-size jumps in `navigate.go`) only
+   activate after two consecutive `skipContainer` lengths match, and direct
+   landings are re-validated — endpoint shape alone is never enough to accept
+   an index.
 6. **The indexed engine is correct at any document size.** The structural index
    packs a 29-bit offset, so documents above 512 MiB cannot be indexed; rather
    than truncate the index (which would silently mis-answer queries into the
@@ -153,5 +157,8 @@ honest result is why SIMD is positioned as optional, not as a headline.
 - **Runnable examples** (`example_test.go`) double as documentation.
 - **Differential fuzzers** (`*_fuzz_test.go`) compare jseek against `encoding/json`
   or cross-check jseek's own engines.
-- **CI** runs build, vet, tests, `-race`, the `jseeksafe` build, and fuzz smoke on
-  amd64 + arm64; a nightly workflow runs longer fuzz campaigns.
+- **CI** (`.github/workflows/ci.yml`) hard-gates on build, vet, tests, `-race`,
+  and the `jseeksafe` / `purego` builds on amd64 + arm64 (`ci success` aggregates
+  the matrix). Fuzz **seed corpus** is required after tests; short generative
+  fuzz is informational. A nightly workflow runs long generative campaigns.
+  Concurrent same-ref runs cancel in progress so only the tip commit finishes.

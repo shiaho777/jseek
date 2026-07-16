@@ -61,20 +61,41 @@ Every change must preserve these (see `docs/ARCHITECTURE.md` for detail):
 ## Running fuzz tests
 
 ```sh
-# Run a single target locally for a minute.
-go test -run=x -fuzz=FuzzGetAgainstStdlib -fuzztime=60s
+# Deterministic seed corpus only (what CI requires on every push):
+go test -count=1 -run='^FuzzGetAgainstStdlib$' .
+
+# Generative fuzz locally for a minute:
+go test -run=^$ -fuzz=FuzzGetAgainstStdlib -fuzztime=60s
 
 # Available targets:
 #   FuzzGetAgainstStdlib        Get vs encoding/json
 #   FuzzDocumentMatchesGet      indexed engine vs stateless Get
+#   FuzzTapeMatchesGet          skip-tape engine vs stateless Get
 #   FuzzEachKeyMatchesGet       multi-path vs repeated Get
+#   FuzzEachDocMatchesEachKey   indexed multi-path vs stateless
 #   FuzzSetAgainstStdlib        Set vs encoding/json
 #   FuzzDeleteAgainstStdlib     Delete vs encoding/json
 #   FuzzStreamMatchesArrayEach  streaming vs ArrayEach
+#   FuzzStreamBytesMatchesDecoder
+#   FuzzPinMatchesGet
+#   FuzzTransposeMatchesGet
 ```
 
 If a fuzzer finds a crash, Go writes the input to `testdata/fuzz/<Target>/`.
 **Commit that file** with your fix — it becomes a permanent regression test.
+
+## CI expectations
+
+- **Required:** the `test` matrix on ubuntu (amd64) and macOS 14 (arm64) —
+  build, `go vet`, unit tests, `-race`, `jseeksafe`, `purego`. The workflow job
+  `ci success` is the single aggregate check for branch protection.
+- **Also required after tests:** fuzz seed-corpus replay for the core targets.
+- **Informational:** short generative fuzz smoke and micro-benchmarks (do not
+  block merge; report findings, fix in follow-up if needed).
+- **Nightly:** full generative fuzz (~10m per target) via
+  `.github/workflows/fuzz-nightly.yml`.
+- Same-ref concurrent runs cancel in progress; push to tip rather than waiting
+  on superseded runs.
 
 ## SIMD / assembly contributions
 
@@ -90,4 +111,4 @@ Hardware SIMD kernels are welcome but held to a high bar:
 
 - Keep PRs focused; one logical change per PR.
 - Describe what you changed, what you tested, and any benchmark deltas.
-- Make sure CI is green on both amd64 and arm64.
+- Make sure the required CI path is green on both amd64 and arm64 (`ci success`).

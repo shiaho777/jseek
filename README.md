@@ -444,10 +444,18 @@ Each has been run for tens of millions of executions with no divergences on
 in-contract input.
 
 Every change is gated by CI (`.github/workflows/ci.yml`) on **both amd64
-(ubuntu) and arm64 (macOS)**: build, `go vet`, tests, the `-race` detector, the
-`jseeksafe` build, and a fuzz smoke run on each target. A nightly workflow runs
-longer fuzz campaigns. This dual-architecture gate is the prerequisite for
-landing hand-written SIMD kernels (AVX2/AVX-512 on amd64, NEON on arm64) safely.
+(ubuntu) and arm64 (macOS)**. The hard gate is the `test` matrix: build, `go
+vet`, unit tests, `-race`, and the `jseeksafe` / `purego` builds. A `ci success`
+job aggregates that matrix so branch protection can require a single check.
+
+After tests pass, CI also runs a **deterministic fuzz seed-corpus** pass on both
+architectures and a short generative fuzz smoke (informational —
+`continue-on-error`, so newly discovered edge cases do not red-X the whole
+workflow). A nightly workflow (`.github/workflows/fuzz-nightly.yml`) runs the
+full generative campaign for ~10 minutes per target. Concurrent runs on the same
+ref cancel in progress so only the tip commit finishes. This dual-architecture
+gate is the prerequisite for landing hand-written SIMD kernels (AVX2/AVX-512 on
+amd64, NEON on arm64) safely.
 
 Two behaviors are intentional and documented, matching `jsonparser`/`gjson`
 rather than `encoding/json`:
@@ -466,9 +474,10 @@ accessors, `Set`/`Delete` mutation, dotted-path and JSON Pointer syntaxes,
 contextual errors, and memory-bounded streaming (`Decoder`/`StreamBytes`).
 
 Correctness is enforced by differential fuzz tests against `encoding/json` and
-across jseek's own engines (tens of millions of executions each), and CI runs the
-suite, the race detector, and the `jseeksafe`/`purego` builds on both amd64 and
-arm64. The public API is considered stable.
+across jseek's own engines (tens of millions of executions each). CI's required
+path runs the unit suite, the race detector, and the `jseeksafe`/`purego` builds
+on both amd64 and arm64, plus fuzz seed-corpus checks; generative fuzz depth
+lives in the nightly job. The public API is considered stable.
 
 The byte scanner uses SWAR today; hand-written AVX2/AVX-512 and NEON kernels are
 an optional future increment behind the existing scan seam — measured to be
