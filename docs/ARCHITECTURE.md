@@ -40,7 +40,7 @@ structure instead of re-reading bytes.
 ├────────────────────────────────────────────────────────────┤
 │ Byte scanning core                                           │
 │   SWAR: indexQuoteOrBackslash, indexSkipWhitespace           │
-│   (SIMD AVX/NEON kernels slot in here behind build tags)     │
+│   SWAR + AVX2 (amd64) / NEON (arm64); purego → SWAR only     │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -93,38 +93,36 @@ Both converge on `valueAt` (in `jseek.go`) for the final value extraction, so th
 share identical type/quote/offset semantics. The `FuzzDocumentMatchesGet` test
 enforces that they always agree on valid JSON.
 
-## The SWAR seam (and where SIMD goes)
+## The SWAR seam (and shipped SIMD)
 
 `scan_swar.go` processes eight bytes per step inside a 64-bit register using
-branch-free bit tricks (`zeroByteMask`). It is the hot loop for string bodies
-and whitespace, which dominate real payload bytes. The exported entry points
-`indexQuoteOrBackslash` / `indexSkipWhitespace` are a dispatch seam
-(`scan_dispatch_*.go`): the portable build routes them to SWAR; a SIMD build
-would route them to a hand-written kernel.
+branch-free bit tricks (`zeroByteMask`). It is the portable floor for string
+bodies and whitespace. Dispatch lives in `scan_dispatch_*.go`:
 
-A hardware-SIMD implementation (AVX2/AVX-512 on amd64, NEON on arm64) would add
-`scan_simd_<arch>.s` plus a Go stub and select it in `scan_dispatch_native.go`,
-typically behind a runtime CPU-feature check. Nothing above the byte-scanning
-core changes. A `purego` build tag always forces the SWAR path.
+| Build | Backend |
+| --- | --- |
+| `purego` or non-x86/arm64 | SWAR only |
+| `amd64 && !purego` | AVX2 string scan (`indexQuoteOrBackslashAVX2`) + SWAR whitespace |
+| `arm64 && !purego` | NEON string scan + `skipContainerNEON` for object/array skip |
 
-### Is hardware SIMD worth it? (measured)
+Nothing above the byte-scanning / container-skip layer changes across backends.
+Assembly frames must stay in lockstep with Go prototypes (`go vet` is the CI
+gate that catches `$0-N` / `ret` vs `ret1` mistakes).
 
-We measured scan throughput on a 4 KB string body (Apple M4 Pro) to decide,
-using a portable 16-byte-wide SWAR prototype as a stand-in for a wider vector:
+### Array strides (FASS)
 
-| Scanner | throughput | vs previous |
-| --- | --- | --- |
-| naive (1 byte/step) | 3.3 GB/s | — |
-| SWAR-8 (current) | 10.6 GB/s | **3.2x** |
-| SWAR-16 (wider-lane prototype) | 11.5 GB/s | 1.09x |
+`findIndexObjectStride` in `navigate.go` accelerates minified homogeneous object
+arrays. Pure endpoint arithmetic only runs after **two** consecutive elements
+agree on `skipContainer` length (`strideConfirmed`); bulk/direct landings call
+`skipContainer` again. That keeps the fast path for real API-list payloads while
+preventing false index matches on malformed siblings that merely place a `}` at
+the expected offset.
 
-The scalar→SWAR-8 step is the big win. Doubling the lane to 16 bytes adds only
-~9%, which means the loop is already close to throughput-bound at this width.
-Hand-written AVX2 (32 B) / NEON (16 B) would fall on the same flattening curve —
-an estimated 10–30% on large inputs — at a large cost in assembly complexity and
-cross-architecture maintenance. The seam exists so SIMD *can* be added when a
-workload justifies it; for now SWAR is the right engineering trade-off. This
-honest result is why SIMD is positioned as optional, not as a headline.
+### Sibling multi-key scan
+
+`fields.go` (`GetFields` / `EachField` / `EachFieldInto`) matches several keys
+under one object in a single member walk, using a small active-key set rather
+than a full multi-path trie — the right tool when the path prefix is shared.
 
 ## Invariants contributors must preserve
 

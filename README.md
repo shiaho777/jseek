@@ -40,12 +40,14 @@ single-field, multi-path, and repeated-access workloads, at **zero allocations**
 across all of them (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). It gets there by
 combining three things no other lazy extractor brings together:
 
-1. **Skip-subtree navigation** — you never pay to parse data you didn't ask for.
-2. **A SWAR scan core** (eight bytes per word) behind a seam where hand-written
-   SIMD can drop in later, with no API change.
-3. **An index-once / query-many engine** plus pinned and columnar APIs that turn
-   repeated work into one-time work — where the lead over everything else widens
-   to **double-digit multiples**.
+1. **Skip-subtree navigation** — you never pay to parse data you didn't ask for,
+   with FASS equal-size strides on homogeneous object arrays.
+2. **A SWAR + SIMD scan core** — portable 8-byte SWAR everywhere; AVX2 (amd64)
+   and NEON (arm64) string/container kernels behind the same seam (`purego`
+   forces SWAR only).
+3. **An index-once / query-many engine** plus `GetFields`, pinned, and columnar
+   APIs that turn repeated work into one-time work — where the lead over
+   everything else widens to **double-digit multiples**.
 
 The honest boundary: `jseek` does not decode whole documents into structs, and on
 a couple of narrow workloads a SIMD full-parser or `gjson` still edges it out —
@@ -55,31 +57,39 @@ large or unpredictable JSON," nothing in Go is faster.
 
 ## Design
 
-`jseek` is built in layers so that the performance-critical core can evolve
-(pure-Go today, SIMD tomorrow) without changing the public API:
+`jseek` is built in layers so the performance-critical core can evolve without
+changing the public API:
 
 | Layer | Responsibility |
 | ----- | -------------- |
-| Public API | `Get`, typed getters, `ArrayEach`, `ObjectEach` |
-| Navigation | skip-subtree traversal to locate keys & indices |
-| Structural scan | locate JSON structural bytes (pure-Go now; SIMD next) |
+| Public API | `Get`, typed getters, `GetFields`/`EachField`, `EachKey`, `ArrayEach`/`ObjectEach`, `Index`/`Pin`/`Transpose`, mutation, streaming |
+| Navigation | skip-subtree traversal, FASS equal-size array strides, multi-key object scan |
+| Structural scan | SWAR portable floor + arch SIMD (AVX2 / NEON) behind build tags |
 | Buffer & memory | zero-copy slices, no allocation on the read path |
 
-The string/value skip loops are isolated precisely so that an AVX2/AVX-512
-(amd64) and NEON (arm64) Stage-1 scanner can drop in behind them later. The
-public API does not change when that lands.
-
-### Scanning core: SWAR today, hand-written SIMD next
+### Scanning core: SWAR floor + shipped SIMD
 
 The hottest loop in JSON traversal is scanning string contents for the next
-quote or backslash, and strings dominate real payload bytes. `jseek` does this
-with **SWAR** (SIMD Within A Register): it loads eight bytes into a 64-bit word
-and locates the next structural byte with branch-free bit tricks, processing 8
-bytes per step instead of one. This is genuine data-parallel scanning that works
-on **every** architecture Go targets, with no assembly and no portability risk.
+quote or backslash, and strings dominate real payload bytes. Every architecture
+gets a **SWAR** (SIMD Within A Register) portable floor: eight bytes per 64-bit
+word with branch-free bit tricks.
 
-Hand-written AVX2/AVX-512 and NEON kernels are a planned increment that slots in
-behind the same function boundary; SWAR is the portable floor, not the ceiling.
+On native builds (`!purego`) the same seam dispatches to hand-written kernels:
+
+- **amd64** — AVX2 string-body scan (`scan_simd_amd64.s` / `scan_string_amd64.go`)
+- **arm64** — NEON string-body scan and container skip
+  (`scan_simd_arm64.s`, `skipContainerNEON`)
+
+Build with `-tags purego` to force the portable SWAR path for debugging or
+targets without assembly. The public API never changes across these backends.
+
+### Array navigation: FASS equal-size strides
+
+Homogeneous object arrays (common in API lists and event batches) enable a
+**fingerprint-anchored structural stride**: after two consecutive elements
+verify the same `skipContainer` length, jseek jumps by fixed size instead of
+re-parsing each sibling. Direct multi-element jumps re-validate the landing
+object so endpoint shape alone cannot accept a false index on malformed input.
 
 ## The "index once, query many" engine
 
@@ -153,9 +163,9 @@ document, reading 12 scattered fields (Apple M4 Pro):
 | reused index, 12 queries | **89 µs** | **0** |
 | gjson `GetManyBytes` | 509 µs | 13 |
 
-The more fields you read per document, the larger the win. The Stage-1 scanner
-is the same SWAR core described below, so the SIMD/NEON milestone accelerates
-this path too.
+The more fields you read per document, the larger the win. Stage-1 scanning
+uses the same SWAR/SIMD core as the rest of the package, so string-heavy
+documents benefit on both the index build and the stateless path.
 
 ## API
 
@@ -258,6 +268,29 @@ name := res[0].String()
 age, _ := res[1].Int()
 admin, _ := res[2].Bool()
 ```
+
+### Sibling fields under one object (`GetFields` / `EachField`)
+
+When several keys live under the **same** object (or under one path prefix), a
+full multi-path trie is more than you need. `GetFields` / `EachField` /
+`EachFieldInto` walk that object once, matching every requested key in a single
+pass — the hot path for "this record, these N columns":
+
+```go
+// path is the parent object; keys are siblings under it.
+res, err := jseek.GetFields(data, []string{"users", "[250]"}, "username", "followers", "email")
+// res[i] is a Result for keys[i]; missing keys are NotExist.
+
+// Zero-allocation callback form; EachFieldInto reuses a caller offset buffer.
+jseek.EachField(data, []string{"users", "[250]"},
+    []string{"username", "followers"},
+    func(idx int, value []byte, vt jseek.ValueType, err error) {
+        // idx is the position in the keys slice
+    })
+```
+
+On large minified object arrays this pairs with FASS strides: jump to the
+element, then harvest multiple fields without re-seeking.
 
 ### Path syntaxes
 
@@ -453,9 +486,8 @@ architectures and a short generative fuzz smoke (informational —
 `continue-on-error`, so newly discovered edge cases do not red-X the whole
 workflow). A nightly workflow (`.github/workflows/fuzz-nightly.yml`) runs the
 full generative campaign for ~10 minutes per target. Concurrent runs on the same
-ref cancel in progress so only the tip commit finishes. This dual-architecture
-gate is the prerequisite for landing hand-written SIMD kernels (AVX2/AVX-512 on
-amd64, NEON on arm64) safely.
+ref cancel in progress so only the tip commit finishes. This dual-architecture gate is what keeps the shipped AVX2/NEON kernels and the
+`purego` fallback honest across amd64 and arm64.
 
 Two behaviors are intentional and documented, matching `jsonparser`/`gjson`
 rather than `encoding/json`:
@@ -468,21 +500,19 @@ rather than `encoding/json`:
 ## Status
 
 The full feature set is in place and rigorously tested: the lazy `Get` family,
-the "index once, query many" engine (`Index`/`IndexTape`), `Pin` and columnar
-`Transpose` for repeated access, multi-path `EachKey`/`GetMany`, generic
-accessors, `Set`/`Delete` mutation, dotted-path and JSON Pointer syntaxes,
-contextual errors, and memory-bounded streaming (`Decoder`/`StreamBytes`).
+sibling-field `GetFields`/`EachField`, the "index once, query many" engine
+(`Index`/`IndexTape`), `Pin` and columnar `Transpose` for repeated access,
+multi-path `EachKey`/`GetMany`, generic accessors, `Set`/`Delete` mutation,
+dotted-path and JSON Pointer syntaxes, contextual errors, and memory-bounded
+streaming (`Decoder`/`StreamBytes`). Navigation includes FASS equal-size array
+strides; scanning includes portable SWAR plus shipped AVX2/NEON kernels (opt out
+with `-tags purego`).
 
 Correctness is enforced by differential fuzz tests against `encoding/json` and
 across jseek's own engines (tens of millions of executions each). CI's required
 path runs the unit suite, the race detector, and the `jseeksafe`/`purego` builds
 on both amd64 and arm64, plus fuzz seed-corpus checks; generative fuzz depth
 lives in the nightly job. The public API is considered stable.
-
-The byte scanner uses SWAR today; hand-written AVX2/AVX-512 and NEON kernels are
-an optional future increment behind the existing scan seam — measured to be
-worth single-digit percent here, so they are not a prerequisite (see
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
 [`CONTRIBUTING.md`](CONTRIBUTING.md) to get involved.
