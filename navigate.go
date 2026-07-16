@@ -249,34 +249,6 @@ func firstKeyEqual(data []byte, obj int, ks, ke int) bool {
 	return true
 }
 
-func hasNestedObjectArray(data []byte, start, end int) bool {
-	i := start + 1
-	for i < end {
-		c := data[i]
-		if c == '"' {
-			e, ok := skipStringBody(data, i+1)
-			if !ok || e > end {
-				return false
-			}
-			i = e
-			continue
-		}
-		if c == '[' {
-			j := i + 1
-			for j < end {
-				cj := data[j]
-				if cj == ' ' || cj == 9 || cj == 10 || cj == 13 {
-					j++
-					continue
-				}
-				return cj == '{'
-			}
-			return false
-		}
-		i++
-	}
-	return false
-}
 func strideObject(data []byte, i, lastLen, nlen int, ks, ke int, haveKey bool) (int, bool) {
 	if lastLen < 2 {
 		return i, false
@@ -494,7 +466,7 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 				}
 			}
 			if !strideOK && lastLen > 0 {
-				strideOK = !hasNestedObjectArray(data, start, start+lastLen)
+				strideOK = true
 			}
 		}
 		if i >= nlen {

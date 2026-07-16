@@ -164,3 +164,37 @@ func TestFindIndexStrideRejectsFalseEqualSize(t *testing.T) {
 		t.Fatalf("valid equal-size still works: %q %v", v, err)
 	}
 }
+
+func TestFindIndexStrideGitHubLikeIssues(t *testing.T) {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < 120; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"id":%d,"number":%d,"title":"Issue number %d","state":"open",`, 1000+i, i, i)
+		fmt.Fprintf(&b, `"user":{"login":"user%d","id":%d,"type":"User"},`, i, 2000+i)
+		fmt.Fprintf(&b, `"labels":[{"id":%d,"name":"bug","color":"f29513"},{"id":%d,"name":"help wanted","color":"159818"}],`, i, i+1)
+		fmt.Fprintf(&b, `"comments":%d,"body":"body %d"}`, i%30, i)
+	}
+	b.WriteByte(']')
+	data := []byte(b.String())
+	for _, n := range []int{0, 1, 9, 10, 50, 99, 100, 119} {
+		v, _, _, err := Get(data, "["+strconv.Itoa(n)+"]", "title")
+		if err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		want := "Issue number " + strconv.Itoa(n)
+		if string(v) != want {
+			t.Fatalf("n=%d title=%q want %q", n, v, want)
+		}
+		u, _, _, err := Get(data, "["+strconv.Itoa(n)+"]", "user", "login")
+		if err != nil || string(u) != "user"+strconv.Itoa(n) {
+			t.Fatalf("n=%d user=%q err=%v", n, u, err)
+		}
+		lab, _, _, err := Get(data, "["+strconv.Itoa(n)+"]", "labels", "[1]", "name")
+		if err != nil || string(lab) != "help wanted" {
+			t.Fatalf("n=%d label=%q err=%v", n, lab, err)
+		}
+	}
+}
