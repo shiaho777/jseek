@@ -38,7 +38,7 @@ func BenchmarkScan_Naive(b *testing.B) {
 func BenchmarkScan_SWAR8(b *testing.B) {
 	b.SetBytes(int64(len(scanInput)))
 	for i := 0; i < b.N; i++ {
-		_ = indexQuoteOrBackslashSWAR(scanInput, 0)
+		_ = indexQuoteOrBackslashSWAR8(scanInput, 0)
 	}
 }
 
@@ -48,3 +48,5 @@ func BenchmarkScan_SWAR16(b *testing.B) {
 		_ = indexQuoteOrBackslashSWAR16(scanInput, 0)
 	}
 }
+
+
