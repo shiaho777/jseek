@@ -120,9 +120,9 @@ the expected offset.
 
 ### Sibling multi-key scan
 
-`fields.go` (`GetFields` / `EachField` / `EachFieldInto`) matches several keys
-under one object in a single member walk, using a small active-key set rather
-than a full multi-path trie — the right tool when the path prefix is shared.
+`fields.go` (`GetFields` / `EachField` / `EachFieldInto` / `EachArrayFields`)
+matches several keys under one object (or every object in an array) in a single
+member walk, using a small active-key set rather than a full multi-path trie.
 
 ## Invariants contributors must preserve
 

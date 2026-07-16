@@ -292,6 +292,26 @@ jseek.EachField(data, []string{"users", "[250]"},
 On large minified object arrays this pairs with FASS strides: jump to the
 element, then harvest multiple fields without re-seeking.
 
+### Array column harvest (`EachArrayFields`)
+
+When you need the **same sibling keys from every object** in an array (analytics,
+ETL, fan-out over `users[]`), `EachArrayFields` walks the array once and, for
+each object element, harvests all requested keys in a **single member pass** —
+no per-element re-seek and no N×`Get` over the element:
+
+```go
+err := jseek.EachArrayFields(data, []string{"users"},
+    []string{"username", "followers"},
+    func(elem, key int, value []byte, vt jseek.ValueType, err error) bool {
+        // elem = array index, key = index into the keys slice
+        return true // false stops early
+    })
+```
+
+On the large fixture (500 users × 2 fields) this is ~76 µs / 0 B vs ~83 µs for
+`ArrayEach` + 2×`Get` per element, and ~3–3.5× faster than gjson/jsonparser on
+the same shape.
+
 ### Path syntaxes
 
 Besides variadic segments, paths can be written as a single string in two
@@ -538,7 +558,8 @@ Representative results on an Apple M4 Pro (lower is better):
 | Large doc, shallow fields | **93 ns** / 0 B | 122 ns / 0 B | 156 ns / 16 B |
 | Large doc, deep indexed (2 Gets) | **3.47 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B |
 | Same via `GetFields` | **1.79 µs** / 0 B | — | — |
-| Large doc, full ArrayEach | **85 µs** / 0 B | 213 µs / 0 B | 298 µs / 188 KB |
+| Large doc, full ArrayEach + 2 fields/elem | **83 µs** / 0 B | 208 µs / 0 B | 276 µs / 188 KB |
+| Large doc, `EachArrayFields` (2 fields/elem) | **76 µs** / 0 B | — | — |
 | Multi-path (6 fields, `EachKey`) | **46.7 µs** / 0 B | — | 196 µs / 536 B |
 | Stateless 12 fields (FASS) | **86 µs** / 0 B | — | 469 µs / 1.2 KB |
 | IndexTape, 12 fields | **5.7 µs** / 0 B | — | — |

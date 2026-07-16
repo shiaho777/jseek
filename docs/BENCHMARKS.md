@@ -62,8 +62,8 @@ from one document."
 | --- | --- | --- | --- | --- |
 | Small payload, 4 fields | **128 ns** / 0 B | 286 ns / 0 B | 359 ns / 144 B | ~719 ns / 284 B |
 | Large doc, shallow fields | **93 ns** / 0 B | 122 ns / 0 B | 156 ns / 16 B | ~350 ns / 81 B |
-| Large doc, deep indexed field (2 Gets) | **3.47 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B | 22.7 µs / 90 B |
-| Same, via `GetFields` (1 seek + sibling harvest) | **1.79 µs** / 0 B | — | — | — |
+| Large doc, deep indexed field (2 Gets) | **3.05 µs** / 0 B | 247 µs / 0 B | 88 µs / 16 B | 22.7 µs / 90 B |
+| Same, via `GetFields` (1 seek + sibling harvest) | **1.58 µs** / 0 B | — | — | — |
 | Large doc, full ArrayEach | **85 µs** / 0 B | 213 µs / 0 B | 298 µs / 188 KB | — |
 
 **Takeaway:** jseek leads the lazy class on every row, at **zero allocation**.
@@ -73,6 +73,21 @@ arm64 path**, still 0 B. Sibling `GetFields` roughly halves that again.
 
 ---
 
+## Result 1b: whole-array field harvest
+
+500 user objects, read `username` + `followers` from each.
+
+| Approach | time | allocs |
+| --- | --- | --- |
+| jseek `EachArrayFields` | **76.5 µs** | 0 B |
+| jseek `ArrayEach` + 2×`Get` per element | 82.6 µs | 0 B |
+| jsonparser `ArrayEach` + 2×`Get` | 208 µs | 0 B |
+| gjson `ForEach` + 2× field access | 276 µs | 188 KB |
+
+**Takeaway:** one member pass per object for all keys beats the classic
+"iterate elements, then N× extract" pattern; both jseek paths crush the
+lazy competitors, zero allocation.
+
 ## Result 2: multi-path (single pass)
 
 Six scattered paths on the large fixture (`meta`, `page`, three `users[i]`,
@@ -80,7 +95,7 @@ Six scattered paths on the large fixture (`meta`, `page`, three `users[i]`,
 
 | Engine | time | allocs |
 | --- | --- | --- |
-| jseek `EachKey` (compiled, FASS array jumps) | **46.7 µs** | 0 B |
+| jseek `EachKey` (compiled, FASS array jumps) | **39.3 µs** | 0 B |
 | jseek N× `Get` | 47.5 µs | 0 B |
 | gjson `GetManyBytes` | 196 µs | 536 B |
 
@@ -197,7 +212,7 @@ than JIT). Even so:
 | --- | --- | --- | --- |
 | Small, 4 fields | **128 ns** / 0 B | ~719 ns / 284 B | **jseek ~5.6×** |
 | Large, shallow 2 fields | **93 ns** / 0 B | ~350 ns / 81 B | **jseek ~3.8×** |
-| Large, deep indexed 2 fields | **3.47 µs** / 0 B | 22.7 µs / 90 B | **jseek ~6.5×** (FASS) |
+| Large, deep indexed 2 fields | **3.05 µs** / 0 B | 22.7 µs / 90 B | **jseek ~6.5×** (FASS) |
 | 12 scattered fields | **86 µs** / 0 B | 119 µs / 572 B | **jseek ~1.4×** |
 | GitHub 7 nested fields | 47.4 µs / 0 B | **15.5 µs** / 328 B | **sonic ~3×** |
 
