@@ -182,6 +182,39 @@ func BenchmarkNDJSON_JseekNDJSONDecoderEach(b *testing.B) {
 	}
 }
 
+func BenchmarkNDJSON_JseekNDJSONDecoderReset(b *testing.B) {
+	q := jseek.CompileStrings(
+		[]string{"latency_ms"},
+		[]string{"status"},
+		[]string{"client", "region"},
+	)
+	dec := jseek.NewNDJSONDecoder(bytes.NewReader(nil))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var totalLatency int64
+		var errs int
+		dec.Reset(bytes.NewReader(ndjsonFixture))
+		_ = dec.ForEach(func(elem []byte) error {
+			q.Each(elem, func(idx int, value []byte, vt jseek.ValueType, err error) {
+				switch idx {
+				case 0:
+					if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok {
+						totalLatency += n
+					}
+				case 1:
+					if n, ok := (jseek.Result{Raw: value, Type: vt}).Int(); ok && n >= 500 {
+						errs++
+					}
+				}
+			})
+			return nil
+		})
+		_ = totalLatency
+		_ = errs
+	}
+}
+
 func BenchmarkNDJSON_JseekStream(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

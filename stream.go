@@ -52,6 +52,23 @@ func NewNDJSONDecoder(r io.Reader) *Decoder {
 	}
 }
 
+func (d *Decoder) Reset(r io.Reader) {
+	if d.r == nil {
+		if d.lineMode {
+			d.r = bufio.NewReaderSize(r, 256<<10)
+		} else {
+			d.r = bufio.NewReaderSize(r, 64<<10)
+		}
+	} else {
+		d.r.Reset(r)
+	}
+	d.buf = d.buf[:0]
+	d.started = d.lineMode
+	d.inArray = false
+	d.done = false
+	d.err = nil
+}
+
 func (d *Decoder) maxValue() int {
 	if d.MaxValue > 0 {
 		return d.MaxValue

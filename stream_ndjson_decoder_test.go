@@ -45,3 +45,20 @@ func TestNDJSONDecoderForEach(t *testing.T) {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 }
+
+func TestNDJSONDecoderReset(t *testing.T) {
+	d := NewNDJSONDecoder(bytes.NewReader([]byte("{\"a\":1}\n")))
+	v, err := d.Next()
+	if err != nil || string(v) != "{\"a\":1}" {
+		t.Fatalf("first %q %v", v, err)
+	}
+	d.Reset(bytes.NewReader([]byte("{\"a\":2}\n{\"a\":3}\n")))
+	var n int
+	_ = d.ForEach(func(v []byte) error {
+		n++
+		return nil
+	})
+	if n != 2 {
+		t.Fatalf("n=%d", n)
+	}
+}
