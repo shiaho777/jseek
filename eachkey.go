@@ -186,54 +186,62 @@ func (p *Paths) matchObject(data []byte, oi, ni int, cb func(int, []byte, ValueT
 }
 
 func (p *Paths) matchArray(data []byte, ai, ni int, cb func(int, []byte, ValueType, error)) {
-	// Determine the highest index we actually care about so we can stop walking
-	// the array early once all requested elements have been seen.
-	maxWanted := -1
-	hasIndexEdge := false
-	for _, e := range p.nodes[ni].edges {
+	edges := p.nodes[ni].edges
+	nWant := 0
+	for _, e := range edges {
 		if e.isIndex {
-			hasIndexEdge = true
-			if e.index > maxWanted {
-				maxWanted = e.index
-			}
+			nWant++
 		}
 	}
-	if !hasIndexEdge {
+	if nWant == 0 {
 		return
 	}
 
-	i := skipWhitespace(data, ai+1)
-	if i < len(data) && data[i] == ']' {
-		return
+	type idxEdge struct {
+		index int
+		child int
 	}
-	idx := 0
-	for i < len(data) {
-		for _, e := range p.nodes[ni].edges {
-			if e.isIndex && e.index == idx {
-				p.match(data, i, e.child, cb)
-				break
-			}
+	var small [16]idxEdge
+	var want []idxEdge
+	if nWant <= len(small) {
+		want = small[:0]
+	} else {
+		want = make([]idxEdge, 0, nWant)
+	}
+	for _, e := range edges {
+		if e.isIndex {
+			want = append(want, idxEdge{index: e.index, child: e.child})
 		}
-		if idx >= maxWanted {
-			return // every requested element has been matched
+	}
+	for a := 1; a < len(want); a++ {
+		for b := a; b > 0 && want[b].index < want[b-1].index; b-- {
+			want[b], want[b-1] = want[b-1], want[b]
 		}
+	}
+
+	nlen := len(data)
+	cur := -1
+	pos := 0
+	for _, w := range want {
 		var ok bool
-		if i, ok = skipValue(data, i); !ok {
-			return
+		if cur < 0 {
+			pos, ok = findIndex(data, ai, w.index)
+		} else if w.index == cur {
+			ok = true
+		} else if w.index > cur {
+			if pos >= nlen || data[pos] != '{' {
+				pos, ok = findIndex(data, ai, w.index)
+			} else {
+				pos, ok = findIndexObjectStride(data, pos, w.index-cur, nlen)
+			}
+		} else {
+			pos, ok = findIndex(data, ai, w.index)
 		}
-		i = skipWhitespace(data, i)
-		if i >= len(data) {
-			return
+		if !ok {
+			continue
 		}
-		switch data[i] {
-		case ',':
-			i = skipWhitespace(data, i+1)
-			idx++
-		case ']':
-			return
-		default:
-			return
-		}
+		p.match(data, pos, w.child, cb)
+		cur = w.index
 	}
 }
 

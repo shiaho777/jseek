@@ -1,6 +1,9 @@
 package jseek
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestEachKey(t *testing.T) {
 	results := map[int]string{}
@@ -78,4 +81,51 @@ func TestEachKeyValuesMatchGet(t *testing.T) {
 			t.Errorf("path %d: EachKey=%q Get=%q", idx, value, want[idx])
 		}
 	}, paths...)
+}
+
+func TestEachKeyArrayStrideMatchesGet(t *testing.T) {
+	var b []byte
+	b = append(b, '[')
+	for i := 0; i < 50; i++ {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		id := strconv.Itoa(i)
+		b = append(b, `{"id":`...)
+		b = append(b, id...)
+		b = append(b, `,"n":"u`...)
+		b = append(b, id...)
+		b = append(b, `"}`...)
+	}
+	b = append(b, ']')
+	paths := [][]string{
+		{"[0]", "id"},
+		{"[1]", "n"},
+		{"[10]", "id"},
+		{"[25]", "n"},
+		{"[49]", "id"},
+	}
+	want := make([]string, len(paths))
+	for i, pth := range paths {
+		v, _, _, err := Get(b, pth...)
+		if err != nil {
+			t.Fatalf("Get %v: %v", pth, err)
+		}
+		want[i] = string(v)
+	}
+	seen := make([]bool, len(paths))
+	CompileStrings(paths...).Each(b, func(idx int, value []byte, vt ValueType, err error) {
+		if err != nil {
+			t.Fatalf("Each %d: %v", idx, err)
+		}
+		seen[idx] = true
+		if string(value) != want[idx] {
+			t.Fatalf("path %d: Each=%q Get=%q", idx, value, want[idx])
+		}
+	})
+	for i, ok := range seen {
+		if !ok {
+			t.Fatalf("missing path %d", i)
+		}
+	}
 }

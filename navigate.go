@@ -490,8 +490,9 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 					ks, ke = s, e
 					haveKey = true
 				}
-				strideOK = !hasNestedObjectArray(data, start, start+lastLen)
-				if !(strideOK && i < nlen && data[i] == ',') {
+				if i < nlen && data[i] == ',' {
+					minified = true
+				} else {
 					minified = false
 				}
 			}
