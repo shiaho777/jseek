@@ -145,3 +145,22 @@ func TestFindIndexMixedTypesFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestFindIndexStrideRejectsFalseEqualSize(t *testing.T) {
+	data := []byte(`[{00000},{"0"0"},{"k":000`)
+	if _, _, _, err := Get(data, "[2]", "k"); err == nil {
+		t.Fatalf("expected Get to reject equal-size false positive through malformed siblings")
+	}
+	seen := false
+	EachKeyStrings(data, func(idx int, value []byte, dataType ValueType, err error) {
+		seen = true
+	}, []string{"[2]", "k"})
+	if seen {
+		t.Fatalf("EachKey should not match path through malformed siblings")
+	}
+	data2 := []byte(`[{"a":1},{"a":2},{"a":3}]`)
+	v, _, _, err := Get(data2, "[2]", "a")
+	if err != nil || string(v) != "3" {
+		t.Fatalf("valid equal-size still works: %q %v", v, err)
+	}
+}

@@ -399,6 +399,10 @@ func tryDirectJump(data []byte, i, remain, lastLen, nlen int, ks, ke int, haveKe
 			}
 		}
 	}
+	end, ok := skipContainer(data, probe)
+	if !ok || end-probe != lastLen {
+		return i, false
+	}
 	return probe, true
 }
 
@@ -431,6 +435,10 @@ func strideObjectsMinified(data []byte, i, lastLen, count, nlen int, ks, ke int,
 	if haveKey && !firstKeyEqual(data, pos, ks, ke) {
 		return i, 0, false
 	}
+	end, ok := skipContainer(data, pos)
+	if !ok || end-pos != lastLen {
+		return i, 0, false
+	}
 	return pos, count, true
 }
 
@@ -442,13 +450,13 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 	ks, ke := 0, 0
 	haveKey := false
 	strideOK := false
+	strideConfirmed := false
 	minified := false
-	base := i
 	for idx := 0; idx < n; {
 		if i >= nlen || data[i] != '{' {
 			return findIndexSlow(data, i, n-idx, nlen)
 		}
-		if strideOK && lastLen > 0 {
+		if strideConfirmed && lastLen > 0 {
 			remain := n - idx
 			if minified {
 				if ni, jumped, ok := strideObjectsMinified(data, i, lastLen, remain, nlen, ks, ke, haveKey); ok {
@@ -462,6 +470,7 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 				idx++
 				continue
 			}
+			strideConfirmed = false
 		}
 		start := i
 		var ok bool
@@ -469,22 +478,33 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 		if !ok {
 			return i, false
 		}
-		lastLen = i - start
-		if !haveKey {
-			if s, e, kok := objectFirstKey(data, start); kok {
-				ks, ke = s, e
-				haveKey = true
+		curLen := i - start
+		if lastLen > 0 && strideOK {
+			if curLen == lastLen {
+				strideConfirmed = true
+			} else {
+				strideConfirmed = false
+				lastLen = curLen
+				haveKey = false
+				if s, e, kok := objectFirstKey(data, start); kok {
+					ks, ke = s, e
+					haveKey = true
+				}
+				strideOK = !hasNestedObjectArray(data, start, start+lastLen)
+				if !(strideOK && i < nlen && data[i] == ',') {
+					minified = false
+				}
 			}
-		}
-		if !strideOK && lastLen > 0 {
-			strideOK = !hasNestedObjectArray(data, start, start+lastLen)
-			if strideOK && i < nlen && data[i] == ',' {
-				minified = true
+		} else {
+			lastLen = curLen
+			if !haveKey {
+				if s, e, kok := objectFirstKey(data, start); kok {
+					ks, ke = s, e
+					haveKey = true
+				}
 			}
-		}
-		if minified && strideOK && lastLen > 0 && n >= 4 {
-			if ni, ok := tryDirectJump(data, base, n, lastLen, nlen, ks, ke, haveKey); ok {
-				return ni, true
+			if !strideOK && lastLen > 0 {
+				strideOK = !hasNestedObjectArray(data, start, start+lastLen)
 			}
 		}
 		if i >= nlen {
@@ -496,9 +516,11 @@ func findIndexObjectStride(data []byte, i, n, nlen int) (int, bool) {
 			if i < nlen && (data[i] == ' ' || data[i] == 9 || data[i] == 10 || data[i] == 13) {
 				i = skipWhitespace(data, i)
 				minified = false
+			} else if strideOK {
+				minified = true
 			}
 			idx++
-			if minified && strideOK && lastLen > 0 {
+			if minified && strideConfirmed && lastLen > 0 {
 				remain := n - idx
 				if remain >= 4 {
 					if ni, ok := tryDirectJump(data, i, remain, lastLen, nlen, ks, ke, haveKey); ok {
