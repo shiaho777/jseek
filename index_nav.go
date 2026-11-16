@@ -289,6 +289,9 @@ func (d *Document) seekIndexed(keys []string) (int, bool) {
 // Get extracts the value at the key path from the indexed document, reusing the
 // shared structural index. Semantics match the package-level Get.
 func (d *Document) Get(keys ...string) (value []byte, dataType ValueType, offset int, err error) {
+	if n := len(keys); n > 0 && keys[n-1] == countSeg {
+		return d.countPathResult(keys[:n-1])
+	}
 	start, ok := d.seekIndexed(keys)
 	if !ok {
 		return nil, NotExist, 0, ErrKeyPathNotFound
