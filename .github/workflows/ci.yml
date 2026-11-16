@@ -170,7 +170,7 @@ jobs:
       - name: Build + test + race + safe + purego on arm64
         run: |
           docker run --rm --platform linux/arm64 \
-            -v "$PWD":/src -w /src golang:1.23 \
+            -v "$PWD":/src -w /src -e GOFLAGS=-buildvcs=false golang:1.23 \
             sh -c 'go build ./... && go vet ./... && go test ./... -count=1 && go test -race ./ -count=1 && go test -tags jseeksafe ./... -count=1 && go test -tags purego ./... -count=1'
 
   bench-compat:
