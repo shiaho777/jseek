@@ -16,8 +16,22 @@ package jseek
 // accepted (decoders replace them later). Duplicate object keys are accepted
 // (RFC 8259 leaves them implementation-defined). Valid never allocates.
 func Valid(data []byte) bool {
+	return validImpl(data, false)
+}
+
+// ValidStrict reports whether data is well-formed JSON under the strict
+// safety defaults popularized by encoding/json/v2: in addition to Valid's
+// syntax check it rejects invalid UTF-8, lone/paired-surrogate escapes, and
+// duplicate object member names. Use it at trust boundaries (gateways,
+// ingestion) where ambiguous input must be refused rather than silently
+// reinterpreted. It allocates only when checking duplicate keys.
+func ValidStrict(data []byte) bool {
+	return validImpl(data, true)
+}
+
+func validImpl(data []byte, strict bool) bool {
 	i := skipWhitespace(data, 0)
-	i, ok := validValue(data, i, 0)
+	i, ok := validValue(data, i, 0, strict)
 	if !ok {
 		return false
 	}
@@ -30,23 +44,26 @@ func Valid(data []byte) bool {
 // bounding stack use (the validator recurses once per nesting level).
 const maxValidDepth = 10000
 
-func validValue(data []byte, i, depth int) (int, bool) {
+func validValue(data []byte, i, depth int, strict bool) (int, bool) {
 	if i >= len(data) {
 		return i, false
 	}
 	switch data[i] {
 	case '"':
+		if strict {
+			return validStringUTF8(data, i)
+		}
 		return validString(data, i)
 	case '{':
 		if depth >= maxValidDepth {
 			return i, false
 		}
-		return validObject(data, i, depth+1)
+		return validObject(data, i, depth+1, strict)
 	case '[':
 		if depth >= maxValidDepth {
 			return i, false
 		}
-		return validArray(data, i, depth+1)
+		return validArray(data, i, depth+1, strict)
 	case 't':
 		return skipTrue(data, i)
 	case 'f':
@@ -60,27 +77,43 @@ func validValue(data []byte, i, depth int) (int, bool) {
 	}
 }
 
-func validObject(data []byte, i, depth int) (int, bool) {
+func validObject(data []byte, i, depth int, strict bool) (int, bool) {
 	n := len(data)
 	i = skipWhitespace(data, i+1)
 	if i < n && data[i] == '}' {
 		return i + 1, true
 	}
+	var seen map[string]struct{}
+	if strict {
+		seen = make(map[string]struct{})
+	}
 	for {
 		if i >= n || data[i] != '"' {
 			return i, false
 		}
+		keyStart := i
 		var ok bool
-		i, ok = validString(data, i)
+		if strict {
+			i, ok = validStringUTF8(data, i)
+		} else {
+			i, ok = validString(data, i)
+		}
 		if !ok {
 			return i, false
+		}
+		if strict {
+			key := string(unescapeInto(nil, data[keyStart+1:i-1]))
+			if _, dup := seen[key]; dup {
+				return i, false
+			}
+			seen[key] = struct{}{}
 		}
 		i = skipWhitespace(data, i)
 		if i >= n || data[i] != ':' {
 			return i, false
 		}
 		i = skipWhitespace(data, i+1)
-		i, ok = validValue(data, i, depth)
+		i, ok = validValue(data, i, depth, strict)
 		if !ok {
 			return i, false
 		}
@@ -99,7 +132,7 @@ func validObject(data []byte, i, depth int) (int, bool) {
 	}
 }
 
-func validArray(data []byte, i, depth int) (int, bool) {
+func validArray(data []byte, i, depth int, strict bool) (int, bool) {
 	n := len(data)
 	i = skipWhitespace(data, i+1)
 	if i < n && data[i] == ']' {
@@ -107,7 +140,7 @@ func validArray(data []byte, i, depth int) (int, bool) {
 	}
 	for {
 		var ok bool
-		i, ok = validValue(data, i, depth)
+		i, ok = validValue(data, i, depth, strict)
 		if !ok {
 			return i, false
 		}
