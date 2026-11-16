@@ -21,20 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            go: "1.23.x"
-            required: true
-          # macOS arm64 runners may be unavailable on some plans/repos
-          # ("configuration ... is not supported" cancels the job before any
-          # step runs). Keep the leg for when runners exist, but do not let
-          # infrastructure cancellation block merges; real arm64 coverage is
-          # guaranteed by the qemu-arm64 job below.
-          - os: macos-14
-            go: "1.23.x"
-            required: false
+        os: [ubuntu-latest]
+        go: ["1.23.x"]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ !matrix.required }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +65,33 @@ jobs:
       - name: Test (purego + jseeksafe)
         run: go test -tags 'purego jseeksafe' -count=1 ./...
 
+  test-macos:
+    name: test (macos-14, informational)
+    # macOS arm64 runners are unavailable on some plans/repos: the job is
+    # cancelled before any step runs ("configuration ... is not supported").
+    # continue-on-error does not neutralize zero-step infra cancellations
+    # inside a shared matrix, so this leg is a separate job that no gate
+    # depends on. When runners exist it provides native arm64 coverage;
+    # the required arm64 gate is qemu-arm64 below.
+    runs-on: macos-14
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+      - name: Build + vet + test + race + safe + purego
+        run: |
+          go build ./... && go vet ./... && go test -count=1 ./... && \
+          go test -race -count=1 ./... && \
+          go test -tags jseeksafe -count=1 ./... && \
+          go test -tags purego -count=1 ./...
+
   fuzz-smoke:
     name: fuzz smoke (${{ matrix.os }})
     needs: [test]
@@ -83,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
