@@ -4,7 +4,52 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"sync"
 )
+
+// bufio.Reader buffers are pooled so that constructing a Decoder per request
+// (the common hot-path shape) does not allocate a fresh 64–256 KiB buffer each
+// time. A Decoder holds its pooled reader until Close or Reset; callers that
+// create many short-lived Decoders should call Close (or reuse via Reset) to
+// return the buffer. Not calling Close merely leaves the buffer to the GC —
+// correctness is unaffected.
+var (
+	bufioPool64 = sync.Pool{New: func() any {
+		b := bufio.NewReaderSize(nil, 64<<10)
+		b.Reset(nilReader{})
+		return b
+	}}
+	bufioPool256 = sync.Pool{New: func() any {
+		b := bufio.NewReaderSize(nil, 256<<10)
+		b.Reset(nilReader{})
+		return b
+	}}
+)
+
+// nilReader is a zero-allocation io.Reader placeholder used to initialize
+// pooled bufio.Readers without binding them to a real source.
+type nilReader struct{}
+
+func (nilReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+func getBufio(lineMode bool) *bufio.Reader {
+	if lineMode {
+		return bufioPool256.Get().(*bufio.Reader)
+	}
+	return bufioPool64.Get().(*bufio.Reader)
+}
+
+func putBufio(r *bufio.Reader, lineMode bool) {
+	if r == nil {
+		return
+	}
+	r.Reset(nilReader{}) // drop reference to the caller's source
+	if lineMode {
+		bufioPool256.Put(r)
+	} else {
+		bufioPool64.Put(r)
+	}
+}
 
 // Streaming decode for inputs too large to hold in memory at once.
 //
@@ -36,32 +81,46 @@ type Decoder struct {
 	done     bool
 	err      error
 	lineMode bool
+	pooled   bool // r came from a pool and must be returned on Close/Reset
 }
 
 const defaultMaxValue = 64 << 20 // 64 MiB
 
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r: bufio.NewReaderSize(r, 64<<10)}
+	br := getBufio(false)
+	br.Reset(r)
+	return &Decoder{r: br, pooled: true}
 }
 
 func NewNDJSONDecoder(r io.Reader) *Decoder {
+	br := getBufio(true)
+	br.Reset(r)
 	return &Decoder{
-		r:        bufio.NewReaderSize(r, 256<<10),
+		r:        br,
 		lineMode: true,
 		started:  true,
+		pooled:   true,
+	}
+}
+
+// Close returns the Decoder's pooled read buffer to the pool. It is optional
+// (the buffer is garbage-collected if Close is never called) but recommended
+// on hot paths that construct many Decoders. After Close the Decoder must not
+// be used again except via Reset. Close is idempotent.
+func (d *Decoder) Close() {
+	if d.pooled {
+		putBufio(d.r, d.lineMode)
+		d.r = nil
+		d.pooled = false
 	}
 }
 
 func (d *Decoder) Reset(r io.Reader) {
 	if d.r == nil {
-		if d.lineMode {
-			d.r = bufio.NewReaderSize(r, 256<<10)
-		} else {
-			d.r = bufio.NewReaderSize(r, 64<<10)
-		}
-	} else {
-		d.r.Reset(r)
+		d.r = getBufio(d.lineMode)
+		d.pooled = true
 	}
+	d.r.Reset(r)
 	d.buf = d.buf[:0]
 	d.started = d.lineMode
 	d.inArray = false
@@ -168,7 +227,25 @@ func (d *Decoder) Next() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	return d.readValue()
+	v, err := d.readValue()
+	if err != nil {
+		return nil, err
+	}
+	// NDJSON auto-detection: a newline-delimited stream (the dominant huge-JSON
+	// shape) is far cheaper to split on newlines than to frame value-by-value.
+	// After the first value, if the next non-space byte is a newline, switch to
+	// line mode for the rest of the stream. Arrays and whitespace-separated
+	// scalars are unaffected. We only switch when more input remains, so a
+	// single trailing value keeps its exact framing.
+	if !d.inArray && !d.lineMode {
+		// Peek the immediate next byte (do NOT skip whitespace): a newline
+		// right after the value means NDJSON. Leave it unconsumed so line
+		// mode skips it as a blank separator.
+		if p, perr := d.r.Peek(1); perr == nil && (p[0] == '\n' || p[0] == '\r') {
+			d.lineMode = true
+		}
+	}
+	return v, nil
 }
 
 // readValue reads exactly one complete JSON value from the reader into d.buf,
@@ -201,18 +278,25 @@ func (d *Decoder) nextLine() ([]byte, error) {
 		d.buf = d.buf[:0]
 		for {
 			chunk, err := d.r.ReadSlice('\n')
+			if err == nil {
+				// Whole line fits in the bufio buffer: trim and return a
+				// zero-copy sub-slice (valid until the next Next call, which
+				// is the documented contract). No per-line copy.
+				line := trimNDJSONLine(chunk)
+				if len(line) > max {
+					d.err = ErrTooLarge
+					return nil, ErrTooLarge
+				}
+				if len(line) == 0 {
+					break // blank line: read the next
+				}
+				return line, nil
+			}
+			// Line spans buffer refills (or EOF): accumulate into d.buf.
 			d.buf = append(d.buf, chunk...)
 			if len(d.buf) > max {
 				d.err = ErrTooLarge
 				return nil, ErrTooLarge
-			}
-			if err == nil {
-				line := trimNDJSONLine(d.buf)
-				if len(line) == 0 {
-					break
-				}
-				d.buf = append(d.buf[:0], line...)
-				return d.buf, nil
 			}
 			if err == io.EOF {
 				d.done = true
@@ -220,8 +304,7 @@ func (d *Decoder) nextLine() ([]byte, error) {
 				if len(line) == 0 {
 					return nil, io.EOF
 				}
-				d.buf = append(d.buf[:0], line...)
-				return d.buf, nil
+				return line, nil
 			}
 			if err == bufio.ErrBufferFull {
 				continue
