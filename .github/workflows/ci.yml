@@ -167,11 +167,14 @@ jobs:
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
-      - name: Build + test + race + safe + purego on arm64
+      - name: Build + test + safe + purego on arm64
+        # -race is skipped here: QEMU exposes a 47-bit VMA and ThreadSanitizer
+        # requires 48 ("unsupported VMA range"). Race coverage comes from the
+        # ubuntu hard gate and native arm64 runs (test-macos when available).
         run: |
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src -w /src -e GOFLAGS=-buildvcs=false golang:1.23 \
-            sh -c 'go build ./... && go vet ./... && go test ./... -count=1 && go test -race ./ -count=1 && go test -tags jseeksafe ./... -count=1 && go test -tags purego ./... -count=1'
+            sh -c 'go build ./... && go vet ./... && go test ./... -count=1 && go test -tags jseeksafe ./... -count=1 && go test -tags purego ./... -count=1'
 
   bench-compat:
     name: bench module differential gates
