@@ -34,6 +34,9 @@ func valueAt(data []byte, start int) (value []byte, dataType ValueType, offset i
 // The returned bytes alias data; they remain valid as long as data is not
 // mutated. Get never allocates.
 func Get(data []byte, keys ...string) (value []byte, dataType ValueType, offset int, err error) {
+	if n := len(keys); n > 0 && keys[n-1] == countSeg {
+		return countPathResult(data, keys[:n-1])
+	}
 	start, ok := seek(data, keys)
 	if !ok {
 		return nil, NotExist, 0, ErrKeyPathNotFound
@@ -59,9 +62,12 @@ func GetString(data []byte, keys ...string) (string, error) {
 	if vt != String {
 		return "", ErrUnexpectedType
 	}
-	// Decode escapes. If there are none, a single allocation via string().
-	out := unescapeInto(nil, v)
-	return string(out), nil
+	// One allocation: the decoded length never exceeds the raw length
+	// (escapes only shrink), so decode straight into the final buffer and
+	// convert without a second copy.
+	buf := make([]byte, len(v))
+	n := len(unescapeInto(buf[:0], v))
+	return string(buf[:n]), nil
 }
 
 // GetStringUnsafe extracts a string value WITHOUT decoding escape sequences and
