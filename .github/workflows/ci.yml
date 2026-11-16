@@ -7,7 +7,9 @@ on:
     branches: [main]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Separate push and pull_request runs so they don't cancel each other;
+  # within one event type, newer commits supersede older runs.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
