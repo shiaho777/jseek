@@ -67,9 +67,14 @@ structure instead of re-reading bytes.
 | `path.go` | dotted-path and JSON Pointer parsing |
 | `errors.go` | `PathError` with path/offset/type context |
 | `mutate.go` | `Set` / `Delete` |
-| `stream.go` | streaming `Decoder` / `NewNDJSONDecoder` (arrays + line-mode NDJSON) |
+| `stream.go` | streaming `Decoder` / `NewNDJSONDecoder` (arrays + auto-detected line-mode NDJSON; pooled bufio buffers, `Close`) |
 | `stream_bytes.go` | in-memory `StreamBytes` / `StreamNDJSON` / `StreamNDJSONEach` |
 | `bytes_unsafe.go` / `bytes_safe.go` | zero-copy vs safe string view (build tag) |
+| `valid.go` | zero-allocation syntax validator (`Valid`, matches `json.Valid`) |
+| `count.go` | container cardinality (`Count`, `CountSeg`, `.#` path results) |
+| `query.go` | gjson-compatible wildcard/filter queries (`Query`, `QueryTyped`, `QueryFirst`) |
+| `format.go` | `Compact` / `Indent` re-serialization (matches stdlib byte-for-byte) |
+| `cmd/jseek/` | single-binary CLI: query / filter / stream / validate / compact / indent |
 
 ## Two scan engines, one extractor
 
@@ -109,6 +114,20 @@ bodies and whitespace. Dispatch lives in `scan_dispatch_*.go`:
 Nothing above the byte-scanning / container-skip layer changes across backends.
 Assembly frames must stay in lockstep with Go prototypes (`go vet` is the CI
 gate that catches `$0-N` / `ret` vs `ret1` mistakes).
+
+### Zero-byte detection: classic mask vs exact mask
+
+`zeroByteMask` is the classic `(v-LSB)&^v&MSB` trick: it never misses a true
+zero byte but its borrow chain can over-report non-zero bytes (0x01 above a
+zero; 0x80 even in zero-free words). Scanners that re-check the located byte
+(quote/backslash/structural) use it directly and keep the short dependency
+chain. Masks trusted without a re-check — the whitespace mask and the
+wide-key terminator mask — use `zeroByteMaskExact`, which short-circuits on
+the classic mask being 0 (the common zero-free word) and otherwise refines
+with the borrow-safe `^(v|((v|MSB)-LSB))&MSB` formula. This closes a
+false-positive class where e.g. `'!'` next to a space was misread as
+whitespace; `TestZeroByteMaskProperties` and `TestNonWhitespaceMaskExact`
+guard it exhaustively.
 
 ### Array strides (FASS)
 

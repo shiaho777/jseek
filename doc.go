@@ -34,6 +34,29 @@
 // pass, so repeated aggregation over a batch runs as a plain slice scan with no
 // further JSON parsing.
 //
+// # Validation and counting
+//
+// Valid reports whether the input is one well-formed JSON value, agreeing
+// with encoding/json.Valid on all inputs, without allocating — the gateway
+// check for untrusted payloads. Count returns the number of array elements
+// or object members at a path without materialization; dotted paths express
+// it as a trailing ".#" (GetPath(data, "users.#")) and the native segment
+// form uses CountSeg.
+//
+// # Formatting and the CLI
+//
+// Compact and Indent re-serialize JSON without decoding into Go values,
+// matching encoding/json byte-for-byte. The cmd/jseek package builds a single
+// static binary exposing query/filter/stream/validate/compact/indent from the
+// terminal — see the README for usage and measured comparisons against jq.
+//
+// # Wildcard and filter queries
+//
+// Query harvests every value matching a gjson-compatible shape path:
+// "users.#.name" (all elements), "users.#(age>30)#.name" (all matches of a
+// filter), "users.#" (count). QueryFirst stops at the first match. "*" is an
+// extension that also iterates object members. Results alias the input.
+//
 // # Mutation and streaming
 //
 // Set and Delete return a new document with a value replaced or removed (the
@@ -41,8 +64,11 @@
 // one downward pass, so it allocates once regardless of path depth. AppendSet
 // and AppendDelete write that result into a caller-provided buffer, so a hot
 // loop reusing one scratch buffer mutates with amortized zero allocation.
-// Decoder streams a top-level array or NDJSON from an io.Reader with bounded
-// memory; StreamBytes does the same over an in-memory slice with zero copy.
+// Decoder streams a top-level array, NDJSON, or whitespace-separated values
+// from an io.Reader with bounded memory; it auto-detects NDJSON after the first
+// value and switches to fast line mode. Read buffers are pooled — call Close or
+// reuse via Reset for ~0 per-request allocations. StreamBytes does the same
+// over an in-memory slice with zero copy.
 //
 // # Scanning core
 //
