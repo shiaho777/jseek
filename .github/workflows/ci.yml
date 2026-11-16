@@ -19,9 +19,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
-        go: ["1.23.x"]
+        include:
+          - os: ubuntu-latest
+            go: "1.23.x"
+            required: true
+          # macOS arm64 runners may be unavailable on some plans/repos
+          # ("configuration ... is not supported" cancels the job before any
+          # step runs). Keep the leg for when runners exist, but do not let
+          # infrastructure cancellation block merges; real arm64 coverage is
+          # guaranteed by the qemu-arm64 job below.
+          - os: macos-14
+            go: "1.23.x"
+            required: false
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ !matrix.required }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +138,23 @@ jobs:
             echo "::endgroup::"
           done
 
+  qemu-arm64:
+    name: test (linux/arm64 via QEMU)
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build + test + race + safe + purego on arm64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src golang:1.23 \
+            sh -c 'go build ./... && go vet ./... && go test ./... -count=1 && go test -race ./ -count=1 && go test -tags jseeksafe ./... -count=1 && go test -tags purego ./... -count=1'
+
   bench-compat:
     name: bench module differential gates
     needs: [test]
@@ -175,12 +203,14 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test, bench-compat]
+    needs: [test, qemu-arm64, bench-compat]
     runs-on: ubuntu-latest
     steps:
-      - name: Require test matrix green
+      - name: Require hard gates green
         run: |
           echo "test result: ${{ needs.test.result }}"
+          echo "qemu-arm64 result: ${{ needs.qemu-arm64.result }}"
           echo "bench-compat result: ${{ needs.bench-compat.result }}"
           test "${{ needs.test.result }}" = "success"
+          test "${{ needs.qemu-arm64.result }}" = "success"
           test "${{ needs.bench-compat.result }}" = "success"

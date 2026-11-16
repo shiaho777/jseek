@@ -35,6 +35,9 @@ jobs:
           - FuzzCountMatchesStdlib
           - FuzzFormatMatchesStdlib
     runs-on: ${{ matrix.os }}
+    # macOS runners may be unavailable on some plans; don't let infra
+    # cancellation mask real results (ubuntu leg still covers every target).
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
