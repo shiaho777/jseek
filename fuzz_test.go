@@ -54,6 +54,11 @@ func FuzzGetAgainstStdlib(f *testing.F) {
 			_, _, _, _ = Get(data, key)
 			return
 		}
+		// CountSeg is a reserved control segment (count request), not a
+		// literal key lookup; it is out of scope for this differential.
+		if key == CountSeg {
+			return
+		}
 
 		// Establish ground truth with the standard library.
 		var top map[string]json.RawMessage

@@ -23,6 +23,12 @@ import (
 //     append "#" — "#(...)#" — to continue with ALL matches.
 //   - "*" is a jseek extension: like "#" but also iterates object members.
 //     (gjson's "*" is a key glob; jseek does not implement key globs.)
+//   - "..key" is recursive descent (jq-style): finds every member named key
+//     at any depth, e.g. "..name" or "users..address.city".
+//   - "[start:end]" slices an array (jq/Python-style); bounds are optional
+//     and negatives count from the end: "[1:3]", "[:2]", "[-2:]".
+//   - Filters combine with "&&" / "||" (&& binds tighter):
+//     "#(age>30 && active==true)#".
 //   - Everything else behaves like GetPath (keys, [N] indices, bare numeric
 //     segments).
 //
@@ -114,6 +120,14 @@ func queryWalkTyped(data []byte, i int, segs []querySeg, out *[]QueryResult, fir
 		return queryWalkTyped(data, j, rest, out, first, stop)
 	case qWild:
 		return queryEachChild(data, i, func(j int) error {
+			return queryWalkTyped(data, j, rest, out, first, stop)
+		}, stop)
+	case qRecursive:
+		return queryRecursive(data, i, seg.key, func(j int) error {
+			return queryWalkTyped(data, j, rest, out, first, stop)
+		}, stop)
+	case qSlice:
+		return querySliceWalk(data, i, seg.slice, func(j int) error {
 			return queryWalkTyped(data, j, rest, out, first, stop)
 		}, stop)
 	case qFilter:
@@ -211,6 +225,14 @@ func queryWalkFirst(data []byte, i int, segs []querySeg, res *[]byte, vt *ValueT
 		return queryEachChild(data, i, func(j int) error {
 			return queryWalkFirst(data, j, rest, res, vt, found)
 		}, found)
+	case qRecursive:
+		return queryRecursive(data, i, seg.key, func(j int) error {
+			return queryWalkFirst(data, j, rest, res, vt, found)
+		}, found)
+	case qSlice:
+		return querySliceWalk(data, i, seg.slice, func(j int) error {
+			return queryWalkFirst(data, j, rest, res, vt, found)
+		}, found)
 	case qFilter:
 		if i >= len(data) || data[i] != '[' {
 			return nil
@@ -237,6 +259,7 @@ type querySeg struct {
 	kind  queryKind
 	key   string // literal key or "[N]"
 	filt  queryFilter
+	slice querySlice
 	count bool // trailing "#": emit cardinality instead of values
 }
 
@@ -247,7 +270,16 @@ const (
 	qWild
 	qFilter
 	qCount
+	qRecursive // "..key": find key at any depth
+	qSlice     // "[start:end]": array slice
 )
+
+// querySlice is a Python/jq-style array slice. Bounds are optional; negative
+// bounds count from the end. hasStart/hasEnd distinguish "[ :3]" from "[0:3]".
+type querySlice struct {
+	start, end       int
+	hasStart, hasEnd bool
+}
 
 type queryFilter struct {
 	key    string
@@ -255,6 +287,11 @@ type queryFilter struct {
 	val    []byte // raw JSON value for comparison
 	hasVal bool
 	all    bool // "#(...)#": continue with all matches, not just the first
+	// Compound form: when logic != "", left/right are combined instead of
+	// the single key/op/val test.
+	logic string // "&&" or "||"
+	left  *queryFilter
+	right *queryFilter
 }
 
 // parseQueryPath compiles the query surface syntax into segments. It mirrors
@@ -290,6 +327,21 @@ func parseQueryPath(path string) []querySeg {
 			}
 		case '.':
 			flush()
+			// ".." introduces recursive descent: the following key is
+			// searched at every depth ("..name", "users..name").
+			if i+1 < len(path) && path[i+1] == '.' {
+				i++
+				j := i + 1
+				for j < len(path) && path[j] != '.' && path[j] != '[' {
+					if path[j] == '\\' && j+1 < len(path) {
+						j++
+					}
+					j++
+				}
+				key := unescapeKey(path[i+1 : j])
+				out = append(out, querySeg{kind: qRecursive, key: key})
+				i = j - 1
+			}
 		case '[':
 			flush()
 			j := strings.IndexByte(path[i:], ']')
@@ -297,7 +349,12 @@ func parseQueryPath(path string) []querySeg {
 				cur.WriteByte(c)
 				continue
 			}
-			out = append(out, querySeg{kind: qKey, key: path[i : i+j+1]})
+			content := path[i+1 : i+j]
+			if sl, ok := parseSlice(content); ok {
+				out = append(out, querySeg{kind: qSlice, slice: sl})
+			} else {
+				out = append(out, querySeg{kind: qKey, key: path[i : i+j+1]})
+			}
 			i += j
 		case '#':
 			flush()
@@ -346,18 +403,103 @@ func parseQueryPath(path string) []querySeg {
 	return out
 }
 
-// parseFilter parses "key op value" (or bare "key") inside #(...).
+// parseFilter parses a filter expression inside #(...): a single
+// "key op value" (or bare "key" existence test), or two expressions joined
+// by "&&" / "||" (left-associative, && binds tighter than ||).
 func parseFilter(s string) (queryFilter, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return queryFilter{}, false
 	}
-	// Locate the operator outside of a leading quoted key (keys are plain).
-	ops := []string{"==", "!=", ">=", "<=", ">", "<"}
-	for _, op := range ops {
-		if j := strings.Index(s, op); j > 0 {
-			key := strings.TrimSpace(s[:j])
-			val := strings.TrimSpace(s[j+len(op):])
+	return parseFilterOr(s)
+}
+
+// parseFilterOr splits on the LAST top-level "||" (left-associative) and
+// recurses; each side below an || is an &&-term.
+func parseFilterOr(s string) (queryFilter, bool) {
+	if j := lastLogic(s, "||"); j >= 0 {
+		l, ok1 := parseFilterOr(s[:j])
+		r, ok2 := parseFilterAnd(s[j+2:])
+		if !ok1 || !ok2 {
+			return queryFilter{}, false
+		}
+		return queryFilter{logic: "||", left: &l, right: &r}, true
+	}
+	return parseFilterAnd(s)
+}
+
+// parseFilterAnd splits on the LAST top-level "&&" and recurses; operands
+// are atoms. Splitting at the last operator yields left-associative grouping.
+func parseFilterAnd(s string) (queryFilter, bool) {
+	if j := lastLogic(s, "&&"); j >= 0 {
+		l, ok1 := parseFilterAnd(s[:j])
+		r, ok2 := parseFilterAtom(s[j+2:])
+		if !ok1 || !ok2 {
+			return queryFilter{}, false
+		}
+		return queryFilter{logic: "&&", left: &l, right: &r}, true
+	}
+	return parseFilterAtom(s)
+}
+
+// lastLogic returns the index of the last top-level occurrence of sep
+// (outside quoted strings), or -1.
+func lastLogic(s, sep string) int {
+	last := -1
+	inStr := false
+	for i := 0; i+len(sep) <= len(s); i++ {
+		c := s[i]
+		if c == '"' && (i == 0 || s[i-1] != '\\') {
+			inStr = !inStr
+			continue
+		}
+		if !inStr && strings.HasPrefix(s[i:], sep) {
+			last = i
+			i++ // skip the second byte of the separator
+		}
+	}
+	return last
+}
+
+func parseFilterAtom(s string) (queryFilter, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return queryFilter{}, false
+	}
+	// Scan for a comparison operator outside quoted strings, skipping the
+	// '&&' logical connector (its '&' must not be read as part of an op).
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' && (i == 0 || s[i-1] != '\\') {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c == '&' && i+1 < len(s) && s[i+1] == '&' {
+			i++
+			continue
+		}
+		var op string
+		switch {
+		case strings.HasPrefix(s[i:], "=="):
+			op = "=="
+		case strings.HasPrefix(s[i:], "!="):
+			op = "!="
+		case strings.HasPrefix(s[i:], ">="):
+			op = ">="
+		case strings.HasPrefix(s[i:], "<="):
+			op = "<="
+		case c == '>':
+			op = ">"
+		case c == '<':
+			op = "<"
+		}
+		if op != "" && i > 0 {
+			key := strings.TrimSpace(s[:i])
+			val := strings.TrimSpace(s[i+len(op):])
 			if key == "" || val == "" {
 				return queryFilter{}, false
 			}
@@ -365,6 +507,71 @@ func parseFilter(s string) (queryFilter, bool) {
 		}
 	}
 	return queryFilter{key: s}, true
+}
+
+// parseSlice parses "start:end" slice content (without brackets). Both bounds
+// are optional; negatives count from the end. Returns false for non-slice
+// content (e.g. a plain index "3").
+func parseSlice(s string) (querySlice, bool) {
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 {
+		return querySlice{}, false
+	}
+	var sl querySlice
+	startStr := strings.TrimSpace(s[:colon])
+	endStr := strings.TrimSpace(s[colon+1:])
+	if startStr != "" {
+		n, ok := parseSignedInt(startStr)
+		if !ok {
+			return querySlice{}, false
+		}
+		sl.start, sl.hasStart = n, true
+	}
+	if endStr != "" {
+		n, ok := parseSignedInt(endStr)
+		if !ok {
+			return querySlice{}, false
+		}
+		sl.end, sl.hasEnd = n, true
+	}
+	return sl, true
+}
+
+func parseSignedInt(s string) (int, bool) {
+	neg := false
+	if s != "" && (s[0] == '-' || s[0] == '+') {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	if s == "" || !isAllDigits(s) {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		n = n*10 + int(s[i]-'0')
+		if n > 1<<30 {
+			return 0, false
+		}
+	}
+	if neg {
+		n = -n
+	}
+	return n, true
+}
+
+// unescapeKey reverses backslash escapes in a dotted-path key segment.
+func unescapeKey(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // queryWalk recursively resolves segments from the value at data[i]. In
@@ -429,6 +636,14 @@ func queryWalk(data []byte, i int, segs []querySeg, out *[][]byte, first bool, s
 		return queryWalk(data, j, rest, out, first, stop)
 	case qWild:
 		return queryEachChild(data, i, func(j int) error {
+			return queryWalk(data, j, rest, out, first, stop)
+		}, stop)
+	case qRecursive:
+		return queryRecursive(data, i, seg.key, func(j int) error {
+			return queryWalk(data, j, rest, out, first, stop)
+		}, stop)
+	case qSlice:
+		return querySliceWalk(data, i, seg.slice, func(j int) error {
 			return queryWalk(data, j, rest, out, first, stop)
 		}, stop)
 	case qFilter:
@@ -521,6 +736,12 @@ func queryEachChild(data []byte, i int, fn func(int) error, stop *bool) error {
 
 // filterMatches reports whether the object element at data[i] satisfies f.
 func filterMatches(data []byte, i int, f queryFilter) bool {
+	if f.logic != "" {
+		if f.logic == "&&" {
+			return filterMatches(data, i, *f.left) && filterMatches(data, i, *f.right)
+		}
+		return filterMatches(data, i, *f.left) || filterMatches(data, i, *f.right)
+	}
 	if i >= len(data) || data[i] != '{' {
 		return false
 	}
@@ -536,6 +757,140 @@ func filterMatches(data []byte, i int, f queryFilter) bool {
 		return false
 	}
 	return compareJSON(v, vt, f.val, f.op)
+}
+
+// queryRecursive visits every object member value whose key equals key, at
+// any nesting depth below data[i] (including i itself). It walks containers
+// with the lazy skip primitives and never decodes values it does not match.
+func queryRecursive(data []byte, i int, key string, fn func(int) error, stop *bool) error {
+	if *stop || i >= len(data) {
+		return nil
+	}
+	switch data[i] {
+	case '{':
+		return queryEachChildKV(data, i, func(k []byte, v int) error {
+			if string(k) == key {
+				if err := fn(v); err != nil {
+					return err
+				}
+				if *stop {
+					return nil
+				}
+			}
+			return queryRecursive(data, v, key, fn, stop)
+		}, stop)
+	case '[':
+		return queryEachChild(data, i, func(v int) error {
+			return queryRecursive(data, v, key, fn, stop)
+		}, stop)
+	default:
+		return nil
+	}
+}
+
+// queryEachChildKV is queryEachChild for objects, additionally passing each
+// member's decoded key. Arrays are iterated as values with nil keys.
+func queryEachChildKV(data []byte, i int, fn func(key []byte, v int) error, stop *bool) error {
+	n := len(data)
+	if i >= n || data[i] != '{' {
+		return nil
+	}
+	j := skipWhitespace(data, i+1)
+	if j < n && data[j] == '}' {
+		return nil
+	}
+	for j < n {
+		if data[j] != '"' {
+			return ErrMalformedJSON
+		}
+		ke, ok := skipString(data, j)
+		if !ok {
+			return ErrMalformedJSON
+		}
+		key := data[j+1 : ke-1]
+		if strings.IndexByte(string(key), '\\') >= 0 {
+			key = unescapeInto(nil, key)
+		}
+		j = skipWhitespace(data, ke)
+		if j >= n || data[j] != ':' {
+			return ErrMalformedJSON
+		}
+		j = skipWhitespace(data, j+1)
+		if err := fn(key, j); err != nil {
+			return err
+		}
+		if *stop {
+			return nil
+		}
+		ve, ok := skipValue(data, j)
+		if !ok {
+			return ErrMalformedJSON
+		}
+		j = skipWhitespace(data, ve)
+		if j >= n {
+			return ErrMalformedJSON
+		}
+		switch data[j] {
+		case ',':
+			j = skipWhitespace(data, j+1)
+		case '}':
+			return nil
+		default:
+			return ErrMalformedJSON
+		}
+	}
+	return ErrMalformedJSON
+}
+
+// querySliceWalk iterates the array elements selected by sl, calling fn with
+// each element's value offset. Bounds are clamped to the array length;
+// negative bounds count from the end.
+func querySliceWalk(data []byte, i int, sl querySlice, fn func(int) error, stop *bool) error {
+	if i >= len(data) || data[i] != '[' {
+		return nil
+	}
+	// Count elements once to resolve negative/clamped bounds.
+	count, err := countArray(data, i)
+	if err != nil {
+		return err
+	}
+	start, end := 0, count
+	if sl.hasStart {
+		start = sl.start
+		if start < 0 {
+			start += count
+		}
+	}
+	if sl.hasEnd {
+		end = sl.end
+		if end < 0 {
+			end += count
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > count {
+		end = count
+	}
+	if start >= end {
+		return nil
+	}
+	idx := 0
+	localStop := false
+	err = queryEachChild(data, i, func(j int) error {
+		if idx >= start && idx < end {
+			if err := fn(j); err != nil {
+				return err
+			}
+		}
+		idx++
+		if idx >= end || *stop {
+			localStop = true // no further elements can match
+		}
+		return nil
+	}, &localStop)
+	return err
 }
 
 // compareJSON compares an extracted value against a raw JSON literal from the

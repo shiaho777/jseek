@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestCountBasic(t *testing.T) {
@@ -115,6 +116,14 @@ func FuzzCountMatchesStdlib(f *testing.F) {
 		if !json.Valid(data) {
 			// Out of contract: only require no panic.
 			Count(data)
+			Count(data, key)
+			return
+		}
+		// jseek matches raw key bytes; encoding/json replaces invalid UTF-8
+		// with U+FFFD, so the two intentionally diverge on malformed bytes.
+		// Restrict the differential to valid UTF-8 (as FuzzGetAgainstStdlib
+		// does). CountSeg is a reserved control segment, not a literal key.
+		if !utf8.Valid(data) || !utf8.ValidString(key) || key == CountSeg {
 			Count(data, key)
 			return
 		}
