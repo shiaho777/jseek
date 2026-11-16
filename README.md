@@ -37,12 +37,21 @@ go install github.com/shiaho777/jseek/cmd/jseek@latest
 jseek user.name config.json                 # extract a field
 jseek 'users.#.name' api.json               # every element's name
 jseek 'users.#(age>30)#.email' api.json     # filtered, all matches
+jseek '..name' api.json                     # recursive descent (any depth)
+jseek 'nums[1:3]' api.json                  # array slice ([-2:] from end)
 jseek -n 'latency_ms' logs.ndjson           # stream 200k log lines, bounded memory
+jseek -n -p 8 'events.#.k' heavy.ndjson     # parallel workers (order preserved)
 jseek -c big.json                           # minify
 jseek -i big.json                           # pretty-print
 jseek -v untrusted.json                     # validate (exit 0/1)
+jseek -v -strict untrusted.json             # + reject bad UTF-8/surrogates/dup keys
 cat api.json | jseek 'users[0].name'        # stdin
 ```
+
+`-p N` parallelizes per-line NDJSON work with order preserved. It pays off for
+compute-heavy queries (e.g. `events.#.k` over 200-event records: ~1.8× at 4
+workers on a 124 MB file); trivial field reads are I/O-bound and stay fastest
+at `-p 1`.
 
 **Measured against `jq 1.7.1` on real files** (Apple M4 Pro, output verified
 byte-identical to jq):
@@ -380,6 +389,22 @@ name, _ := jseek.GetString(body, "user", "name")
 
 Measured ~1.0 GB/s on a 22 KB document (Apple M4 Pro), 0 allocs.
 
+`ValidStrict` adds the safety defaults popularized by `encoding/json/v2`:
+it additionally rejects invalid UTF-8, lone/unpaired surrogate escapes, and
+duplicate object member names. Use it at trust boundaries where ambiguous
+input must be refused rather than silently reinterpreted:
+
+```go
+if !jseek.ValidStrict(untrusted) {
+    // reject: bad UTF-8, lone surrogates, or duplicate keys
+}
+```
+
+`ValidStrict` is a strict subset of `Valid` (anything it accepts also passes
+`Valid` and decodes cleanly with the stdlib). It allocates only for the
+duplicate-key check; scalar/array validation stays zero-allocation. The CLI
+exposes it as `jseek -v -strict`.
+
 ### Counting (`Count`, `#` paths)
 
 `Count` returns the number of array elements or object members at a path
@@ -417,12 +442,19 @@ n, _     := jseek.Query(data, "users.#")               // array length
 - `#(key op value)` filters elements (`== != > >= < <=`; strings, numbers,
   bools, null; bare key = existence). Default continues with the **first**
   match (gjson semantics); append `#` — `#(...)#` — for **all** matches.
+  Combine with `&&` / `||` (`&&` binds tighter): `#(age>30 && active==true)#`.
+- `..key` is recursive descent (jq-style): every member named `key` at any
+  depth — `..name`, `users..address.city`.
+- `[start:end]` slices arrays (jq/Python-style); bounds optional, negatives
+  count from the end: `nums[1:3]`, `nums[:2]`, `nums[-2:]`.
 - `*` is a jseek extension: like `#` but also iterates object members.
 
-Measured on 500 records (Apple M4 Pro): `users.#.name` **~21 µs / 33 KB**
-vs gjson ~68 µs / 151 KB (**~3.2× faster, ~4.6× less memory**); filtered
+Measured on 500 records (Apple M4 Pro): `users.#.name` **~19 µs / 33 KB**
+vs gjson ~64 µs / 151 KB (**~3.3× faster, ~4.6× less memory**); filtered
 all-matches ~37 µs vs ~62 µs. Semantics are cross-checked against gjson by
-`TestQueryMatchesGJSON` and `FuzzQueryMatchesGJSON` in `bench/`.
+`TestQueryMatchesGJSON` / `FuzzQueryMatchesGJSON` (bench/) and against jq
+byte-for-byte for the advanced forms; `FuzzQueryAdvancedNoPanic` guards the
+recursive/slice/compound paths.
 
 ### Formatting (`Compact` / `Indent`)
 

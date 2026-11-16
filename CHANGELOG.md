@@ -7,6 +7,16 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Advanced query syntax**: recursive descent `..key`, array slices
+  `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
+  with `&&`-over-`||` precedence. Output verified byte-identical to jq;
+  guarded by `FuzzQueryAdvancedNoPanic`.
+- **`ValidStrict`**: json/v2-style safety validation — rejects invalid UTF-8,
+  lone/unpaired surrogates, and duplicate object keys. Strict subset of
+  `Valid`; zero-alloc on scalars/arrays. CLI: `jseek -v -strict`.
+- **CLI parallel NDJSON (`-p N`)**: order-preserving read/process/write
+  pipeline; ~1.8× at 4 workers on compute-heavy per-line queries (124 MB
+  fixture). Documented boundary: trivial field reads are I/O-bound, default 1.
 - **`jseek` CLI** (`cmd/jseek`): single static binary, zero runtime
   dependencies — path/wildcard/filter queries, NDJSON streaming with bounded
   memory, validation, compact and pretty-print. Measured 15–75× faster than

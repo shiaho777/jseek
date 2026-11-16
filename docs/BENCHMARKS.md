@@ -373,6 +373,41 @@ New library APIs backing the CLI: `Compact` / `Indent` (match stdlib
 byte-for-byte, `FuzzFormatMatchesStdlib`), `QueryTyped` (typed results so a
 string `"42"` is never confused with the number `42`).
 
+## 2026-11 round 4: advanced query syntax, strict validation, parallel NDJSON
+
+Driven by a frontier survey (simdjson v5.2 On-Demand, Go 1.27 json/v2, jaq 3.x,
+Glaze SWAR-first, Pison parallel indexing). Shipped the high-ROI items:
+
+**Query expressiveness** (jq-compatible, output verified byte-identical to jq):
+recursive descent `..key`, array slices `[start:end]` with negative bounds,
+compound filters `#(a && b || c)#` with correct `&&`-over-`||` precedence.
+Guarded by `FuzzQueryAdvancedNoPanic` (4.9M execs) + jq cross-checks. Core
+harvest unchanged: `users.#.name` ~19 µs vs gjson ~64 µs (~3.3×).
+
+**`ValidStrict`**: json/v2-style safety defaults (reject invalid UTF-8, lone
+surrogates, duplicate keys). Strict subset of `Valid`; zero-alloc on
+scalars/arrays, allocates only for the duplicate-key map. CLI: `-v -strict`.
+
+**CLI parallel NDJSON (`-p N`)**: read/process/write pipeline, order preserved.
+Measured on a 124 MB file (20 000 lines × 200 events), query `events.#.k`:
+
+| workers | time |
+| --- | --- |
+| 1 | 0.29 s |
+| 2 | 0.21 s |
+| 4 | **0.16 s (~1.8×)** |
+| 8 | 0.18 s |
+
+**Recorded boundary:** parallelism only pays for compute-heavy per-line work.
+Trivial field reads (`latency_ms`) are I/O-bound: `-p 1` 0.29 s vs `-p 8` 0.35 s
+(coordination overhead dominates). The flag is documented accordingly; default
+stays 1. Large single-doc queries remain ~7–23× faster than jq (`..city`:
+0.01 s vs 0.23 s on 50 000 records).
+
+**Deferred (honest):** `jsontext` interop needs Go 1.27 (local toolchain is
+1.23.4 — cannot verify, so not shipped blind); Pison-style parallel structural
+indexing and arm64 SVE kernels need hardware/CI this machine lacks.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

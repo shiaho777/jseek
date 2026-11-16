@@ -24,10 +24,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/shiaho777/jseek"
 )
@@ -40,8 +42,10 @@ func main() {
 		compact  = flag.Bool("c", false, "compact (minify) JSON")
 		indent   = flag.Bool("i", false, "pretty-print JSON (2-space indent)")
 		ndjson   = flag.Bool("n", false, "treat input as NDJSON; apply path to each line")
+		parallel = flag.Int("p", 1, "with -n: number of parallel workers (order preserved)")
 		raw      = flag.Bool("r", false, "raw output: print strings without quotes")
 		validate = flag.Bool("v", false, "validate JSON; exit 0 if valid, 1 otherwise")
+		strict   = flag.Bool("strict", false, "with -v: also reject invalid UTF-8, lone surrogates, duplicate keys")
 		count    = flag.Bool("C", false, "print the count of array elements / object members at path")
 		showVer  = flag.Bool("version", false, "print version and exit")
 	)
@@ -69,7 +73,7 @@ func main() {
 	}
 
 	if *validate {
-		os.Exit(runValidate(files))
+		os.Exit(runValidate(files, *strict))
 	}
 
 	if len(files) == 0 {
@@ -92,7 +96,11 @@ func main() {
 		case *indent:
 			rerr = runIndent(r, w)
 		case *ndjson:
-			rerr = runNDJSON(r, w, path, *raw, *count)
+			if *parallel > 1 {
+				rerr = runNDJSONParallel(r, w, path, *raw, *count, *parallel)
+			} else {
+				rerr = runNDJSON(r, w, path, *raw, *count)
+			}
 		default:
 			rerr = runQuery(r, w, path, *raw, *count)
 		}
@@ -113,8 +121,11 @@ Flags:
   -c          compact (minify) JSON
   -i          pretty-print JSON
   -n          NDJSON mode: apply path to each line
+  -p N        with -n: N parallel workers (order preserved); pays off for
+              compute-heavy per-line queries, not trivial field reads
   -r          raw output (strings without quotes)
   -v          validate JSON (exit 0 valid / 1 invalid)
+  -strict     with -v: reject invalid UTF-8, lone surrogates, duplicate keys
   -C          print count at path instead of values
   -version    print version
 
@@ -125,13 +136,16 @@ Path syntax:
   users.#              array length
   users.#(age>30).name first match of a filter
   users.#(age>30)#.name all matches ("#(...)#")
+  users.#(a>1 && b<2)#  compound filters (&& / ||)
+  ..name               recursive descent (any depth)
+  nums[1:3]            array slice (negatives from end: [-2:])
   meta.*               object members ("*" extension)
 
 Examples:
   jseek user.name config.json
   jseek 'users.#(active==true)#.email' api.json
-  jseek -n 'latency_ms' logs.ndjson
-  jseek -c big.json | jseek -v
+  jseek -n -p 8 'latency_ms' logs.ndjson
+  jseek -c big.json | jseek -v -strict
 `)
 }
 
@@ -158,9 +172,13 @@ func readAll(r io.Reader) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-func runValidate(files []string) int {
+func runValidate(files []string, strict bool) int {
 	if len(files) == 0 {
 		files = []string{"-"}
+	}
+	check := jseek.Valid
+	if strict {
+		check = jseek.ValidStrict
 	}
 	bad := 0
 	for _, f := range files {
@@ -175,7 +193,7 @@ func runValidate(files []string) int {
 			fmt.Fprintln(os.Stderr, "jseek:", rerr)
 			return 2
 		}
-		if jseek.Valid(data) {
+		if check(data) {
 			fmt.Printf("%s: valid\n", displayName(f))
 		} else {
 			fmt.Printf("%s: invalid\n", displayName(f))
@@ -257,37 +275,136 @@ func runQuery(r io.Reader, w *bufio.Writer, path string, raw, count bool) error 
 	return nil
 }
 
+// processLine renders one NDJSON element into buf according to the mode.
+func processLine(buf *bytes.Buffer, elem []byte, path string, raw, count bool) error {
+	if path == "" || path == "." {
+		out, err := jseek.Compact(elem)
+		if err != nil {
+			return err
+		}
+		buf.Write(out)
+		buf.WriteByte('\n')
+		return nil
+	}
+	if count {
+		n, err := jseek.Count(elem, jseek.ParseDotPath(path)...)
+		if err != nil {
+			return nil // missing path on a line: skip
+		}
+		fmt.Fprintln(buf, n)
+		return nil
+	}
+	results, err := jseek.QueryTyped(elem, path)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(buf)
+	for _, res := range results {
+		writeTyped(bw, res, raw)
+	}
+	return bw.Flush()
+}
+
 // runNDJSON streams line-by-line with bounded memory.
 func runNDJSON(r io.Reader, w *bufio.Writer, path string, raw, count bool) error {
 	dec := jseek.NewNDJSONDecoder(r)
 	defer dec.Close()
+	var buf bytes.Buffer
 	return dec.ForEach(func(elem []byte) error {
-		if path == "" || path == "." {
-			out, err := jseek.Compact(elem)
-			if err != nil {
-				return err
-			}
-			w.Write(out)
-			w.WriteByte('\n')
-			return nil
-		}
-		if count {
-			n, err := jseek.Count(elem, jseek.ParseDotPath(path)...)
-			if err != nil {
-				return nil // missing path on a line: skip
-			}
-			fmt.Fprintln(w, n)
-			return nil
-		}
-		results, err := jseek.QueryTyped(elem, path)
-		if err != nil {
+		buf.Reset()
+		if err := processLine(&buf, elem, path, raw, count); err != nil {
 			return err
 		}
-		for _, res := range results {
-			writeTyped(w, res, raw)
-		}
-		return nil
+		_, err := w.Write(buf.Bytes())
+		return err
 	})
+}
+
+// runNDJSONParallel processes NDJSON with n workers in a read/process/write
+// pipeline that preserves input order. Reading and writing stay sequential
+// (order + single stdout); the per-line query work runs concurrently.
+func runNDJSONParallel(r io.Reader, w *bufio.Writer, path string, raw, count bool, n int) error {
+	if n < 1 {
+		n = 1
+	}
+	if n == 1 {
+		return runNDJSON(r, w, path, raw, count)
+	}
+	type job struct {
+		seq  int
+		line []byte
+	}
+	type result struct {
+		seq int
+		out []byte
+		err error
+	}
+	jobs := make(chan job, n*4)
+	results := make(chan result, n*4)
+
+	// Workers: process lines concurrently.
+	var wg sync.WaitGroup
+	for k := 0; k < n; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var buf bytes.Buffer
+			for j := range jobs {
+				buf.Reset()
+				err := processLine(&buf, j.line, path, raw, count)
+				out := append([]byte(nil), buf.Bytes()...)
+				results <- result{seq: j.seq, out: out, err: err}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	// Reader: split input into lines, dispatch in order.
+	readErr := make(chan error, 1)
+	go func() {
+		defer close(jobs)
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 256<<10), 64<<20)
+		seq := 0
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			cp := append([]byte(nil), line...)
+			jobs <- job{seq: seq, line: cp}
+			seq++
+		}
+		readErr <- sc.Err()
+	}()
+
+	// Writer: reorder by sequence and emit.
+	pending := make(map[int]result)
+	next := 0
+	var writeErr error
+	for res := range results {
+		if res.err != nil && writeErr == nil {
+			writeErr = res.err
+		}
+		pending[res.seq] = res
+		for {
+			p, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			if writeErr == nil && len(p.out) > 0 {
+				if _, err := w.Write(p.out); err != nil && writeErr == nil {
+					writeErr = err
+				}
+			}
+			next++
+		}
+	}
+	if err := <-readErr; err != nil && writeErr == nil {
+		writeErr = err
+	}
+	return writeErr
 }
 
 // writeTyped prints one typed result. Strings are re-quoted for valid JSON

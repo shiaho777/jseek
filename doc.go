@@ -38,10 +38,11 @@
 //
 // Valid reports whether the input is one well-formed JSON value, agreeing
 // with encoding/json.Valid on all inputs, without allocating — the gateway
-// check for untrusted payloads. Count returns the number of array elements
-// or object members at a path without materialization; dotted paths express
-// it as a trailing ".#" (GetPath(data, "users.#")) and the native segment
-// form uses CountSeg.
+// check for untrusted payloads. ValidStrict adds json/v2-style safety defaults
+// (rejects invalid UTF-8, lone surrogates, duplicate keys). Count returns the
+// number of array elements or object members at a path without materialization;
+// dotted paths express it as a trailing ".#" (GetPath(data, "users.#")) and the
+// native segment form uses CountSeg.
 //
 // # Formatting and the CLI
 //
@@ -55,7 +56,9 @@
 // Query harvests every value matching a gjson-compatible shape path:
 // "users.#.name" (all elements), "users.#(age>30)#.name" (all matches of a
 // filter), "users.#" (count). QueryFirst stops at the first match. "*" is an
-// extension that also iterates object members. Results alias the input.
+// extension that also iterates object members. Advanced forms: "..key"
+// recursive descent, "[start:end]" array slices (negative bounds from end),
+// and compound filters "#(a && b || c)#". Results alias the input.
 //
 // # Mutation and streaming
 //
