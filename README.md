@@ -117,6 +117,36 @@ APIs:
   `Store.Close` (mmap-backed, concurrent-safe, read-only).
 - **Split index + payload**: `Document.Persist`, `Open`, `View` /
   `ViewTrusted`, `VerifyIndex`, `Document.IndexSize`.
+- **Zero-allocation reuse**: `ViewInto(d, idx, data)` re-points an existing
+  Document — a hot loop that opens repeatedly allocates **nothing**.
+
+### NDJSON random-access store
+
+Logs, events, and metrics are the largest large-JSON shape, and a plain
+`.ndjson` file can only be scanned sequentially. `SealNDJSON` builds a
+per-record offset table plus a sealed index per record, so **record N is
+reachable in O(1)** and queryable with zero re-parsing:
+
+```go
+jseek.SealNDJSON(out, ndjsonReader)     // build once
+s, _ := jseek.OpenNDJSONStore("logs.njstore")
+defer s.Close()
+d, _ := s.Record(999999)                // O(1) jump, zero re-parse
+lat, _ := d.GetInt("latency_ms")
+s.Each(func(i int, d *jseek.Document) bool { /* zero-alloc scan */ ; return true })
+```
+
+```sh
+jseek -seal-n logs.ndjson logs.njstore
+jseek -open-n logs.njstore 'latency_ms' -at 999999   # one record, instant
+jseek -append-n logs.njstore new.ndjson              # incremental append
+```
+
+**Measured** (5000 records, jump to record 4999 + field read): **~45 ns / 0
+allocs** via the store vs **~69 µs** for a sequential scan that must walk every
+prior record — **~1500×**. `AppendNDJSON` copies prior records verbatim and
+indexes only the new ones (O(new records)). Guarded by
+`FuzzNDJSONStoreRoundTrip`.
 
 The zero-copy view reinterprets the index arrays in place (default build);
 `-tags jseeksafe` decodes them safely instead. mmap is used on unix; other

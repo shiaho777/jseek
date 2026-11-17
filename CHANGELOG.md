@@ -23,6 +23,13 @@ tagged releases begin.
 - **CLI store modes**: `jseek -seal in.json out.jstore` and
   `jseek -open out.jstore 'path'` expose the substrate from the terminal.
 - **FuzzPersistRoundTrip**: persist→open round-trip + corrupt-rejection fuzz.
+- **NDJSON random-access store**: `SealNDJSON`, `OpenNDJSONStore`,
+  `NDJSONStore.Record`/`RecordInto`/`Raw`/`Each`/`Len`/`Close`, `AppendNDJSON`.
+  Per-record offset table + sealed indexes give O(1) record jumps (~45 ns vs
+  ~69 µs sequential, ~1500×) and incremental append. CLI: `-seal-n` / `-open-n
+  -at N` / `-append-n`. Guarded by `FuzzNDJSONStoreRoundTrip`.
+- **Zero-allocation reuse**: `ViewInto` re-points an existing Document for
+  alloc-free hot loops.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

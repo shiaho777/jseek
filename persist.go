@@ -262,6 +262,44 @@ func ViewTrusted(idx, data []byte) (*Document, error) {
 	return view(idx, data, false)
 }
 
+// ViewInto is the zero-allocation trusted view: it re-points an existing
+// Document at the persisted index instead of allocating a new one. In a hot
+// loop that opens the same (or successive) sealed images, keep one Document
+// and ViewInto it repeatedly — no per-open allocation at all.
+//
+// d must not be a pooled Document that will be Freed (ViewInto aliases idx's
+// arrays, which the pool must not recycle). d's previous contents are
+// overwritten. Semantics match ViewTrusted: verify the mapping once with
+// VerifyIndex first; idx/data must stay immutable and alive while d is used.
+func ViewInto(d *Document, idx, data []byte) (*Document, error) {
+	h, ok := parseIndexHeader(idx)
+	if !ok {
+		return nil, ErrBadIndex
+	}
+	if h.dataLen != uint64(len(data)) {
+		return nil, ErrBadIndex
+	}
+	need := persistHeader + int(h.nStruct)*4
+	if h.flags&flagTape != 0 {
+		need += int(h.nStruct) * 4
+	}
+	if need != len(idx) || h.nStruct > uint64(len(data))+1 {
+		return nil, ErrBadIndex
+	}
+	d.data = data
+	d.gen = nextDocGen()
+	d.oversize = false
+	d.hasTape = h.flags&flagTape != 0
+	d.structurals = u32Slice(idx[persistHeader : persistHeader+int(h.nStruct)*4])
+	if d.hasTape {
+		off := persistHeader + int(h.nStruct)*4
+		d.tape = u32Slice(idx[off : off+int(h.nStruct)*4])
+	} else {
+		d.tape = nil
+	}
+	return d, nil
+}
+
 // VerifyIndex checks that idx is a well-formed persisted index bound to data
 // (magic, version, lengths, payload hash, offset bounds). Call it once after
 // mapping a file; then use ViewTrusted for O(1) opens.

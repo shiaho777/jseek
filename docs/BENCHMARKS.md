@@ -468,6 +468,39 @@ by process startup + file read (0.17s vs 0.19s over 20 runs on 7.4 MB) — the
 substrate's real win is repeated in-process opens (the library numbers above),
 not one-shot CLI invocations.
 
+## 2026-11 round 7: NDJSON random-access store + zero-alloc reuse
+
+- **NDJSON random-access store** (`ndjson_store.go`): `SealNDJSON` builds a
+  per-record uint64 offset table + a sealed index per record; `OpenNDJSONStore`
+  maps and validates once; `Record(i)` / `RecordInto` jump in O(1). `Each`
+  scans with a reused Document (zero alloc). `AppendNDJSON` copies prior
+  records verbatim and indexes only new ones (incremental write path).
+  CLI: `-seal-n` / `-open-n ... -at N` / `-append-n`.
+
+  Measured (5000 records, jump to record 4999 + GetInt), same-binary A/B:
+
+  | Path | time | allocs |
+  | --- | --- | --- |
+  | Store.RecordInto(4999) | **~45 ns** | **0** |
+  | Sequential scan to 4999 (plain NDJSON reader) | ~69 µs | 128 B / 2 |
+
+  **~1500×** for random access vs sequential — the qualitative change from
+  "logs can only be scanned" to "any record instantly". CLI `-at` over 50
+  process invocations: 0.15 s total.
+
+- **ViewInto / RecordInto**: zero-allocation trusted views that re-point an
+  existing Document. Hot loops allocate **0** (verified by AllocsPerRun;
+  skipped under jseeksafe where arrays are decoded).
+
+- **Bug found & fixed by FuzzNDJSONStoreRoundTrip**: parseNDJSON did not set
+  the image field, so Record's last-record index bound sliced out of range
+  when called directly. Fixed; 4.2M fuzz execs clean.
+
+**Honest boundaries:** the NDJSON store trades ~per-record index overhead for
+O(1) access; it suits read-heavy stable logs, not high-frequency single-record
+mutation (append rebuilds the tail table). Random-access win grows with record
+count; for tiny files a sequential scan is fine.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find
