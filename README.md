@@ -119,6 +119,11 @@ APIs:
   `ViewTrusted`, `VerifyIndex`, `Document.IndexSize`.
 - **Zero-allocation reuse**: `ViewInto(d, idx, data)` re-points an existing
   Document — a hot loop that opens repeatedly allocates **nothing**.
+- **Field-level writes**: `PatchSet` / `PatchDelete` update a Document's index
+  incrementally (no full re-scan); `Store.Set` / `Store.Delete` return a new
+  sealed image with the edit applied. Stores stay immutable — write the new
+  image and re-open. (The payload copy dominates cost, so this enables writes
+  more than it accelerates them; see BENCHMARKS.md.)
 
 ### NDJSON random-access store
 

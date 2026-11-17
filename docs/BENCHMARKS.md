@@ -501,6 +501,32 @@ O(1) access; it suits read-heavy stable logs, not high-frequency single-record
 mutation (append rebuilds the tail table). Random-access win grows with record
 count; for tiny files a sequential scan is fine.
 
+## 2026-11 round 8: incremental index patch — the single-document write path
+
+`PatchSet` / `PatchDelete` update a Document's index without a full re-scan:
+structurals before the edit keep their offsets, structurals after shift by the
+length delta, and only the edited region is re-scanned. `Store.Set` /
+`Store.Delete` expose field-level writes on a sealed store (returning a new
+image). Correctness gated by `FuzzPatchMatchesRebuild` (5.5M execs, patched
+index == full rebuild on every probe).
+
+**Honest measurement — this is a modest win, not a breakthrough:**
+
+| Scenario (2000–5000 records) | FullRebuild | IncrementalPatch |
+| --- | --- | --- |
+| front edit, mixed doc | ~62 µs / 344 KB | ~53 µs / 189 KB (~17% faster, ~45% less mem) |
+| front edit, string-heavy | ~153 µs | ~153 µs (parity) |
+| tail edit, string-heavy | ~181 µs | ~176 µs (~3%) |
+
+**Why the gain is limited:** a Set/Delete shifts every byte after the edit, so
+the payload MUST be copied in full (contiguous JSON has no gap to exploit). The
+memcpy dominates; the index re-scan it avoids was already the cheaper part. The
+patch's real value is (a) it makes field-level writes on the substrate possible
+at all without re-parsing string bodies, (b) ~45% less index allocation on
+front edits, and (c) it is the foundation for a future persistent write path.
+It is NOT a dramatic speedup, and we record it as such. A truly cheap write
+would need a non-contiguous / paged payload format — a larger redesign, deferred.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

@@ -30,6 +30,13 @@ tagged releases begin.
   -at N` / `-append-n`. Guarded by `FuzzNDJSONStoreRoundTrip`.
 - **Zero-allocation reuse**: `ViewInto` re-points an existing Document for
   alloc-free hot loops.
+- **Incremental index patch (single-document write path)**: `PatchSet` /
+  `PatchDelete` update a Document's index without a full re-scan (prefix kept,
+  suffix shifted, edit region re-scanned). `Store.Set` / `Store.Delete` expose
+  field-level writes on a sealed store. Guarded by `FuzzPatchMatchesRebuild`
+  (5.5M execs). Honest note: modest speed gain (~0–17%) because the payload copy
+  dominates; the value is enabling writes + ~45% less index memory on front
+  edits, not a dramatic speedup.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

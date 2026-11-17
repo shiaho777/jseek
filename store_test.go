@@ -107,6 +107,54 @@ func TestStoreMmap(t *testing.T) {
 	}
 }
 
+func TestStoreSetDelete(t *testing.T) {
+	data := persistFixture()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.jstore")
+	f, _ := os.Create(path)
+	Seal(f, data)
+	f.Close()
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := s.Set([]byte(`999`), "users", "[250]", "score")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	os.WriteFile(path, img, 0644)
+	s2, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("reopen after set: %v", err)
+	}
+	d, _ := s2.View()
+	if v, err := d.GetInt("users", "[250]", "score"); err != nil || v != 999 {
+		t.Errorf("after set score=%d err=%v", v, err)
+	}
+	if v, _ := d.GetInt("users", "[0]", "score"); v != 0 {
+		t.Errorf("record 0 changed: %d", v)
+	}
+	img2, err := s2.Delete("meta", "v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+	os.WriteFile(path, img2, 0644)
+	s3, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	d3, _ := s3.View()
+	if d3.Exists("meta", "v") {
+		t.Error("meta.v still exists after delete")
+	}
+	if v, _ := d3.GetInt("users", "[250]", "score"); v != 999 {
+		t.Errorf("set value lost after delete: %d", v)
+	}
+}
+
 func TestStoreConcurrentViews(t *testing.T) {
 	data := persistFixture()
 	dir := t.TempDir()

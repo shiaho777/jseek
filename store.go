@@ -1,6 +1,7 @@
 package jseek
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -198,4 +199,44 @@ func (s *Store) Close() error {
 		return err
 	}
 	return nil
+}
+
+// Set returns a new sealed store image with the value at keys replaced by
+// setValue, using an incremental index patch (no full re-scan of the payload).
+// The receiver is unchanged (stores are immutable); write the returned image to
+// a new file (or atomically replace the old one) and re-open it. setValue must
+// be valid JSON.
+func (s *Store) Set(setValue []byte, keys ...string) ([]byte, error) {
+	d, err := s.View()
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := PatchSet(d, s.layout.data, setValue, keys...)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := Seal(&buf, out); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Delete returns a new sealed store image with the value at keys removed.
+// If the path is absent the image is returned unchanged. The receiver is
+// unchanged.
+func (s *Store) Delete(keys ...string) ([]byte, error) {
+	d, err := s.View()
+	if err != nil {
+		return nil, err
+	}
+	out, _, _, err := PatchDelete(d, s.layout.data, keys...)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := Seal(&buf, out); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
