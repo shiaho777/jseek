@@ -420,13 +420,13 @@ Measured (Apple M4 Pro, 27 KB doc, open + deep GetInt), same-binary A/B:
 
 | Path | time | allocs |
 | --- | --- | --- |
-| RebuildIndexTape (re-scan every open) | ~20 µs | 109 KB / 7 |
-| Open (streaming decode + hash) | ~41 µs | 74 KB / 7 |
-| View (zero-copy + per-open hash) | ~27.6 µs | 128 B / 1 |
-| **ViewTrusted after one VerifyIndex** | **~138 ns** | **128 B / 1** |
+| RebuildIndexTape (re-scan every open) | ~19.5 µs | 109 KB / 7 |
+| Open (streaming decode + hash + offset verify) | ~20 µs | 74 KB / 7 |
+| View (zero-copy + full hash & offset verify) | ~7.9 µs | 128 B / 1 |
+| **ViewTrusted after one VerifyIndex** | **~126 ns** | **128 B / 1** |
 
 The canonical mmap pattern (map once → VerifyIndex once → ViewTrusted many)
-is **~145× faster and ~850× less allocating** than rebuilding. Cross-process
+is **~155× faster and ~850× less allocating** than rebuilding. Cross-process
 demo: writer seals store.json + store.jix; reader maps and sustains 100 000
 opens + 2-field queries at ~229 ns each.
 
@@ -439,6 +439,34 @@ opens + 2-field queries at ~229 ns each.
   data, stateless Get / Index remains the right tool.
 - -tags jseeksafe decodes the arrays (3 allocs) instead of zero-copy
   reinterpreting; the guarantee there is safety, not zero allocation.
+
+## 2026-11 round 6: substrate hardening + self-contained stores + CLI
+
+- **Fast payload hash**: replaced byte-wise FNV-1a (~0.3 GB/s) with a
+  word-at-a-time multiply-xor-rotate mix measured at **~6.7 GB/s** (~20×).
+  This made the fully-verified `View` (~7.9 µs) **~2.5× faster than rebuilding**
+  (~19.5 µs) — integrity no longer costs more than a re-scan. Format flags bit1
+  records the hash algorithm; the format is experimental (pre-1.0).
+- **Offset bounds validation**: every structural/tape offset is checked against
+  the payload length on View/Open/VerifyIndex, so a corrupt-but-hash-matching
+  image can never drive navigation out of bounds. Runs with the hash check;
+  the trusted O(1) path skips it (already verified). ViewTrusted stays ~126 ns.
+- **Self-contained stores** (`store.go`): `Seal`/`OpenSealed`/`ViewSealed`/
+  `ViewSealedTrusted`/`VerifySealed` pack payload+index into one "JSEEKST1"
+  file (payload padded to 4-byte alignment for zero-copy index reinterpret).
+- **mmap store handle**: `OpenStore`/`Store.View`/`Store.Close` maps a sealed
+  file read-only once, verifies once, hands out concurrent-safe O(1) Documents.
+  unix uses syscall.Mmap; other platforms fall back to a one-time read.
+- **CLI**: `jseek -seal in.json out.jstore` and `jseek -open out.jstore 'path'`
+  expose the substrate from the terminal.
+- **FuzzPersistRoundTrip**: persist→View/Open round-trip agreement + corrupt
+  rejection on arbitrary bytes (5.7M execs clean). Full matrix + windows/linux
+  cross-compilation green.
+
+**Honest note:** CLI single-shot `-open` vs reading the raw .json is dominated
+by process startup + file read (0.17s vs 0.19s over 20 runs on 7.4 MB) — the
+substrate's real win is repeated in-process opens (the library numbers above),
+not one-shot CLI invocations.
 
 ## Discipline about the numbers
 

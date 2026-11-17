@@ -47,6 +47,8 @@ func main() {
 		validate = flag.Bool("v", false, "validate JSON; exit 0 if valid, 1 otherwise")
 		strict   = flag.Bool("strict", false, "with -v: also reject invalid UTF-8, lone surrogates, duplicate keys")
 		count    = flag.Bool("C", false, "print the count of array elements / object members at path")
+		seal     = flag.Bool("seal", false, "build a self-contained zero-parse store: jseek -seal in.json out.jstore")
+		open     = flag.Bool("open", false, "query a sealed store with zero re-parsing: jseek -open store.jstore 'path'")
 		showVer  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -55,6 +57,14 @@ func main() {
 	if *showVer {
 		fmt.Println("jseek " + version)
 		return
+	}
+
+	// Store modes have their own argument shapes; handle before generic parsing.
+	if *seal {
+		os.Exit(runSeal(flag.Args()))
+	}
+	if *open {
+		os.Exit(runOpenStore(flag.Args(), *raw, *count))
 	}
 
 	args := flag.Args()
@@ -127,6 +137,8 @@ Flags:
   -v          validate JSON (exit 0 valid / 1 invalid)
   -strict     with -v: reject invalid UTF-8, lone surrogates, duplicate keys
   -C          print count at path instead of values
+  -seal       build a zero-parse store: jseek -seal in.json out.jstore
+  -open       query a store with no re-parsing: jseek -open out.jstore 'path'
   -version    print version
 
 Path syntax:
@@ -146,6 +158,8 @@ Examples:
   jseek 'users.#(active==true)#.email' api.json
   jseek -n -p 8 'latency_ms' logs.ndjson
   jseek -c big.json | jseek -v -strict
+  jseek -seal big.json big.jstore        # build once
+  jseek -open big.jstore 'users.#.name'  # query forever, zero re-parse
 `)
 }
 
@@ -170,6 +184,97 @@ func openInput(f string) (io.Reader, func(), error) {
 
 func readAll(r io.Reader) ([]byte, error) {
 	return io.ReadAll(r)
+}
+
+// runSeal builds a self-contained store: jseek -seal in.json out.jstore
+func runSeal(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "jseek: -seal needs <input.json> <output.jstore>")
+		return 2
+	}
+	data, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	if !jseek.Valid(data) {
+		fmt.Fprintln(os.Stderr, "jseek: input is not valid JSON")
+		return 1
+	}
+	out, err := os.Create(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	defer out.Close()
+	bw := bufio.NewWriter(out)
+	if err := jseek.Seal(bw, data); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if err := bw.Flush(); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	st, _ := out.Stat()
+	fmt.Fprintf(os.Stderr, "sealed %s -> %s (%d bytes payload, %d bytes store)\n",
+		args[0], args[1], len(data), st.Size())
+	return 0
+}
+
+// runOpenStore queries a sealed store with zero re-parsing:
+// jseek -open store.jstore 'path'   (no path = pretty-print payload)
+func runOpenStore(args []string, raw, count bool) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: -open needs <store.jstore> [path]")
+		return 2
+	}
+	s, err := jseek.OpenStore(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer s.Close()
+	path := ""
+	if len(args) > 1 {
+		path = args[1]
+	}
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	data := s.Data()
+	if path == "" || path == "." {
+		out, err := jseek.Indent(data, "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		w.Write(out)
+		w.WriteByte('\n')
+		return 0
+	}
+	d, err := s.View()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if count {
+		n, err := d.Count(jseek.ParseDotPath(path)...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintln(w, n)
+		return 0
+	}
+	results, err := jseek.QueryTyped(data, path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	for _, res := range results {
+		writeTyped(w, res, raw)
+	}
+	return 0
 }
 
 func runValidate(files []string, strict bool) int {

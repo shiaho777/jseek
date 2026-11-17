@@ -10,10 +10,19 @@ tagged releases begin.
 - **Persistent structural index — zero-parse data substrate**: `Document.Persist`,
   `Open`, `View`, `ViewTrusted`, `VerifyIndex`, `IndexSize`. The pointer-free
   index is sealed to disk once and re-opened by any process with no re-scan;
-  the canonical mmap pattern (verify once, then `ViewTrusted`) opens in ~138 ns
-  / 128 B vs ~20 µs / 109 KB to rebuild (~145× / ~850×). Cross-process demo
-  sustains 100k opens+queries at ~229 ns. Payload bound by 64-bit hash;
-  zero-copy reinterpretation in the default build, safe decode under `jseeksafe`.
+  the canonical mmap pattern (verify once, then `ViewTrusted`) opens in ~126 ns
+  / 128 B vs ~19.5 µs / 109 KB to rebuild (~155× / ~850×). Cross-process demo
+  sustains 100k opens+queries at ~229 ns. Payload bound by a word-parallel
+  64-bit hash (~6.7 GB/s); zero-copy reinterpretation in the default build,
+  safe decode under `jseeksafe`. Every index offset is bounds-checked.
+- **Self-contained sealed stores**: `Seal`, `OpenSealed`, `ViewSealed`,
+  `ViewSealedTrusted`, `VerifySealed` pack payload+index into one portable file.
+- **mmap store handle**: `OpenStore` / `Store.View` / `Store.Close` — read-only
+  mapping, verified once, concurrent-safe O(1) views (unix mmap; other
+  platforms fall back to a one-time read).
+- **CLI store modes**: `jseek -seal in.json out.jstore` and
+  `jseek -open out.jstore 'path'` expose the substrate from the terminal.
+- **FuzzPersistRoundTrip**: persist→open round-trip + corrupt-rejection fuzz.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

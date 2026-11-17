@@ -79,33 +79,48 @@ fields from it repeatedly (config stores, document caches, IPC shared state,
 edge-device state, feature stores).
 
 ```go
-// Writer process: build the index once, seal it to disk.
-d := jseek.IndexTape(data)
-d.Persist(indexFile)            // alongside the raw .json payload
+// One self-contained file: payload + index, sealed once.
+jseek.Seal(file, data)                  // -> store.jstore
 
-// Reader process (any process, any time): map once, verify once…
-jseek.VerifyIndex(idxBytes, data)
-// …then open in O(1) and query, forever, with no re-scan:
-doc, _ := jseek.ViewTrusted(idxBytes, data)
+// Any process: mmap it, verify once, then open in O(1) forever.
+s, _ := jseek.OpenStore("store.jstore") // maps read-only + verifies
+defer s.Close()
+doc, _ := s.View()                      // O(1), zero re-parse, zero-copy
 rps, _ := doc.GetInt("config", "limits", "rps")
+```
+
+Or from the terminal:
+
+```sh
+jseek -seal big.json big.jstore         # build once
+jseek -open big.jstore 'users.#.name'   # query forever, zero re-parse
 ```
 
 **Measured** (Apple M4 Pro, 27 KB doc, open + deep query):
 
 | Path | time | allocs |
 | --- | --- | --- |
-| Rebuild index from bytes (every process today) | ~20 µs | 109 KB |
-| `ViewTrusted` after one-time `VerifyIndex` | **~138 ns** | **128 B** |
+| Rebuild index from bytes (every process today) | ~19.5 µs | 109 KB |
+| `View` (zero-copy + full hash & offset verify) | ~7.9 µs | 128 B |
+| `ViewTrusted` after one-time `VerifyIndex` | **~126 ns** | **128 B** |
 
-**~145× faster open, ~850× less memory.** A cross-process demo (writer seals
-`store.json` + `store.jix`; reader maps and queries) sustains **100 000
-opens + 2-field queries at ~229 ns each**. The index is bound to its payload
-by a 64-bit hash, so a stale or tampered pairing is rejected (`ErrBadIndex`).
+**~155× faster open, ~850× less memory** on the trusted path; even the
+fully-verified `View` is ~2.5× faster than rebuilding. The payload hash is a
+word-parallel mix running at **~6.7 GB/s** (vs ~0.3 GB/s for byte-wise FNV),
+and every index offset is bounds-checked, so a corrupt or stale image is
+rejected (`ErrBadIndex`) — never an out-of-bounds read. A cross-process demo
+sustains **100 000 opens + 2-field queries at ~229 ns each**.
 
-APIs: `Document.Persist`, `Open` (streaming, verifies hash), `View` /
-`ViewTrusted` (zero-copy over resident/mmap'd bytes), `VerifyIndex`,
-`Document.IndexSize`. The zero-copy view reinterprets the index arrays in
-place (default build); `-tags jseeksafe` decodes them safely instead.
+APIs:
+- **Self-contained stores**: `Seal`, `OpenSealed`, `ViewSealed` /
+  `ViewSealedTrusted`, `VerifySealed`, and `OpenStore` / `Store.View` /
+  `Store.Close` (mmap-backed, concurrent-safe, read-only).
+- **Split index + payload**: `Document.Persist`, `Open`, `View` /
+  `ViewTrusted`, `VerifyIndex`, `Document.IndexSize`.
+
+The zero-copy view reinterprets the index arrays in place (default build);
+`-tags jseeksafe` decodes them safely instead. mmap is used on unix; other
+platforms fall back to a one-time read. The format is experimental (pre-1.0).
 
 ## State of the art for lazy JSON extraction
 
