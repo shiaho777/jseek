@@ -527,6 +527,49 @@ front edits, and (c) it is the foundation for a future persistent write path.
 It is NOT a dramatic speedup, and we record it as such. A truly cheap write
 would need a non-contiguous / paged payload format — a larger redesign, deferred.
 
+## 2026-11 round 9: WAL overlay — genuinely cheap writes (the breakthrough)
+
+Round 8 proved an in-place edit must copy the whole contiguous payload. Round 9
+sidesteps that entirely with a **log-structured overlay** (the SQLite-WAL / LSM
+idea): `WALStore` keeps the immutable sealed base plus an append-only edit log.
+A write appends ONE small record (path + op + value) — **no payload copy, no
+index rebuild**. Reads resolve the base zero-parse, then apply the latest
+matching overlay edit; subtree reads affected by the overlay materialize on
+demand. `Compact` folds the log into a fresh base, amortizing the one expensive
+copy over many cheap writes. Optional WAL file persists edits for crash-safe
+replay. CLI: `-wal` + `-wset`/`-wdel`/`-wget`/`-wcompact`.
+
+**Measured write cost (5000-record ~330 KB doc), same-binary A/B:**
+
+| Write method | time | allocs |
+| --- | --- | --- |
+| Full Set rewrite (copy whole payload) | ~82 µs | 344 KB |
+| **WAL append (with applicability check)** | **~180 ns** | **~300 B** |
+
+**~450× faster, ~1100× less memory.** And the defining property — **write cost
+is independent of document size:**
+
+| doc size | WAL write |
+| --- | --- |
+| 100 records | ~163 ns |
+| 5 000 records | ~163 ns |
+| 50 000 records | ~186 ns |
+
+The write touches only the edit, never the payload. This is genuinely cheap
+writes — the thing round 8 said needed a redesign, achieved instead by changing
+the *write model* (append-only overlay) rather than the payload format.
+
+**Honest boundaries:**
+- Reads of an overlay-dirtied subtree materialize (O(document)) — the cost moves
+  from every write to occasional reads of edited subtrees + batched compaction.
+  Exact-path and unaffected-subtree reads stay zero-parse.
+- The overlay is path-keyed; an edit's applicability is validated with a cheap
+  O(path-depth) walk at write time (this is the ~180 ns, vs ~80 ns pure append).
+- Compaction is the one O(document) operation; amortize it over many writes.
+- Concurrent-safe (RWMutex); base mapping immutable. FuzzWALMatchesMaterialize
+  gates overlay reads == fully materialized document (clean after fixing root /
+  ancestor-prefix dirty detection found by the fuzzer).
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

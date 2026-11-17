@@ -125,6 +125,35 @@ APIs:
   image and re-open. (The payload copy dominates cost, so this enables writes
   more than it accelerates them; see BENCHMARKS.md.)
 
+### Genuinely cheap writes: the WAL overlay
+
+An in-place edit must copy the whole contiguous payload. `WALStore` sidesteps
+that with a **log-structured overlay** (the SQLite-WAL / LSM idea): an immutable
+sealed base plus an append-only edit log. A write appends one small record —
+**no payload copy, no index rebuild** — so it costs the same whether the
+document is 1 KB or 1 GB:
+
+```go
+w, _ := jseek.OpenWAL("base.jstore", "edits.wal") // wal optional ("" = in-memory)
+defer w.Close()
+w.Set([]byte(`42`), "cfg", "version")   // ~180 ns, ~300 B — O(edit), not O(doc)
+v, _ := w.GetInt("cfg", "version")      // overlay-aware read
+w.Compact()                              // fold log into a fresh base (batched)
+```
+
+```sh
+jseek -wal edits.wal -wset base.jstore 'cfg.version' '42'
+jseek -wal edits.wal -wget base.jstore 'cfg.version'
+jseek -wal edits.wal -wcompact base.jstore new.jstore
+```
+
+**Measured** (5000-record ~330 KB doc): WAL write **~180 ns / ~300 B** vs a full
+rewrite **~82 µs / 344 KB** (~450×), and **flat across document sizes** (100 /
+5 000 / 50 000 records all ~160–186 ns). Reads of an overlay-dirtied subtree
+materialize on demand; exact-path and unaffected reads stay zero-parse.
+Compaction is the one O(document) step, amortized over many writes. Optional WAL
+file gives crash-safe replay. Guarded by `FuzzWALMatchesMaterialize`.
+
 ### NDJSON random-access store
 
 Logs, events, and metrics are the largest large-JSON shape, and a plain

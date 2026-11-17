@@ -37,6 +37,13 @@ tagged releases begin.
   (5.5M execs). Honest note: modest speed gain (~0–17%) because the payload copy
   dominates; the value is enabling writes + ~45% less index memory on front
   edits, not a dramatic speedup.
+- **WAL overlay store — genuinely cheap writes**: `WALStore` (`OpenWAL`/`NewWAL`,
+  `Set`/`Delete`/`Get`/`Exists`/typed getters, `Pending`/`Compact`/`Close`).
+  Append-only edit log over an immutable sealed base: a write is ~180 ns / ~300 B
+  vs ~82 µs / 344 KB for a full rewrite (~450×), and **independent of document
+  size** (100→50 000 records all ~160–186 ns). Optional WAL file for crash-safe
+  replay; `Compact` folds the log into a new base. CLI: `-wal` +
+  `-wset`/`-wdel`/`-wget`/`-wcompact`. Guarded by `FuzzWALMatchesMaterialize`.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

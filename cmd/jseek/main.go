@@ -54,6 +54,11 @@ func main() {
 		openN    = flag.Bool("open-n", false, "query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]")
 		appendN  = flag.Bool("append-n", false, "append records: jseek -append-n store.njstore new.ndjson")
 		at       = flag.Int("at", -1, "with -open-n: select a single record by index (0-based)")
+		wal      = flag.String("wal", "", "WAL log file for cheap writes (used with -wset/-wdel/-wget/-wcompact)")
+		wset     = flag.Bool("wset", false, "cheap write: jseek -wal log -wset store.jstore 'path' 'jsonValue'")
+		wdel     = flag.Bool("wdel", false, "cheap delete: jseek -wal log -wdel store.jstore 'path'")
+		wget     = flag.Bool("wget", false, "overlay-aware read: jseek -wal log -wget store.jstore 'path'")
+		wcompact = flag.Bool("wcompact", false, "fold WAL into a new base: jseek -wal log -wcompact store.jstore out.jstore")
 		showVer  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -76,6 +81,9 @@ func main() {
 	}
 	if *openN {
 		os.Exit(runOpenNDJSON(flag.Args(), *raw, *count, *at))
+	}
+	if *wset || *wdel || *wget || *wcompact {
+		os.Exit(runWAL(flag.Args(), *wal, *wset, *wdel, *wget, *wcompact, *raw))
 	}
 	if *appendN {
 		os.Exit(runAppendNDJSON(flag.Args()))
@@ -157,6 +165,11 @@ Flags:
   -open-n     query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]
   -append-n   append records: jseek -append-n store.njstore new.ndjson
   -at N       with -open-n: select one record by index (0-based)
+  -wal FILE   WAL log for cheap writes (with -wset/-wdel/-wget/-wcompact)
+  -wset       cheap write: jseek -wal log -wset store.jstore 'path' 'jsonValue'
+  -wdel       cheap delete: jseek -wal log -wdel store.jstore 'path'
+  -wget       overlay read: jseek -wal log -wget store.jstore 'path'
+  -wcompact   fold WAL into new base: jseek -wal log -wcompact store.jstore out.jstore
   -version    print version
 
 Path syntax:
@@ -460,6 +473,93 @@ func runAppendNDJSON(args []string) int {
 		return 2
 	}
 	fmt.Fprintf(os.Stderr, "appended -> %d total records\n", total)
+	return 0
+}
+
+// runWAL handles cheap-write modes over a sealed base + WAL log.
+//   -wset store.jstore 'path' 'jsonValue'
+//   -wdel store.jstore 'path'
+//   -wget store.jstore 'path'
+//   -wcompact store.jstore out.jstore
+func runWAL(args []string, walPath string, wset, wdel, wget, wcompact, raw bool) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: WAL modes need <store.jstore> ...")
+		return 2
+	}
+	w, err := jseek.OpenWAL(args[0], walPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer w.Close()
+	switch {
+	case wset:
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "jseek: -wset needs <store> <path> <jsonValue>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		if err := w.Set([]byte(args[2]), keys...); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "set %s (%d pending)\n", args[1], w.Pending())
+	case wdel:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wdel needs <store> <path>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		if err := w.Delete(keys...); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "deleted %s (%d pending)\n", args[1], w.Pending())
+	case wget:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wget needs <store> <path>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		v, vt, err := w.Get(keys...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		bw := bufio.NewWriter(os.Stdout)
+		writeTyped(bw, jseek.QueryResult{Raw: v, Type: vt}, raw)
+		bw.Flush()
+	case wcompact:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wcompact needs <store> <out.jstore>")
+			return 2
+		}
+		if err := w.Compact(); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		// After compact the base holds everything; write it out via a fresh
+		// seal of the compacted payload.
+		d, _, err := w.Get()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		out, err := os.Create(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 2
+		}
+		bw := bufio.NewWriter(out)
+		if err := jseek.Seal(bw, d); err != nil {
+			out.Close()
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		bw.Flush()
+		out.Close()
+		fmt.Fprintf(os.Stderr, "compacted -> %s\n", args[1])
+	}
 	return 0
 }
 
