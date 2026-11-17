@@ -79,6 +79,10 @@ go test -run=^$ -fuzz=FuzzGetAgainstStdlib -fuzztime=60s
 #   FuzzStreamBytesMatchesDecoder
 #   FuzzPinMatchesGet
 #   FuzzTransposeMatchesGet
+#   FuzzValidMatchesStdlib      Valid vs encoding/json.Valid
+#   FuzzCountMatchesStdlib      Count vs stdlib decode cardinality
+#   FuzzFormatMatchesStdlib     Compact/Indent vs encoding/json
+#   FuzzQueryMatchesGJSON       (bench module) Query vs gjson semantics
 ```
 
 If a fuzzer finds a crash, Go writes the input to `testdata/fuzz/<Target>/`.
@@ -87,9 +91,14 @@ If a fuzzer finds a crash, Go writes the input to `testdata/fuzz/<Target>/`.
 ## CI expectations
 
 - **Required:** the `test` matrix on ubuntu (amd64) and macOS 14 (arm64) —
-  build, `go vet`, unit tests, `-race`, `jseeksafe`, `purego`. The workflow job
-  `ci success` is the single aggregate check for branch protection.
-- **Also required after tests:** fuzz seed-corpus replay for the core targets.
+  build, `go vet`, unit tests, `-race`, `jseeksafe`, `purego`, and the combined
+  `purego jseeksafe` build. The workflow job `ci success` is the single
+  aggregate check for branch protection.
+- **Also required:** the `bench-compat` job — the `bench/` module's
+  differential tests against gjson/jsonparser/sonic (including
+  `TestQueryMatchesGJSON`).
+- **Also required after tests:** fuzz seed-corpus replay for all differential
+  targets.
 - **Informational:** short generative fuzz smoke and micro-benchmarks (do not
   block merge; report findings, fix in follow-up if needed).
 - **Nightly:** full generative fuzz (~10m per target) via

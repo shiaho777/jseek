@@ -1,0 +1,7 @@
+go test fuzz v1
+string("0\x8eaa")
+int(0)
+bool(false)
+string("[")
+int(-32)
+bool(false)

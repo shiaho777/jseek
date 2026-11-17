@@ -2,12 +2,14 @@ name: jseek CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**", "fix/**"]
   pull_request:
     branches: [main]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Separate push and pull_request runs so they don't cancel each other;
+  # within one event type, newer commits supersede older runs.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -19,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest]
         go: ["1.23.x"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -60,6 +62,36 @@ jobs:
       - name: Test (purego)
         run: go test -tags purego -count=1 ./...
 
+      - name: Test (purego + jseeksafe)
+        run: go test -tags 'purego jseeksafe' -count=1 ./...
+
+  test-macos:
+    name: test (macos-14, informational)
+    # macOS arm64 runners are unavailable on some plans/repos: the job is
+    # cancelled before any step runs ("configuration ... is not supported").
+    # continue-on-error does not neutralize zero-step infra cancellations
+    # inside a shared matrix, so this leg is a separate job that no gate
+    # depends on. When runners exist it provides native arm64 coverage;
+    # the required arm64 gate is qemu-arm64 below.
+    runs-on: macos-14
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+      - name: Build + vet + test + race + safe + purego
+        run: |
+          go build ./... && go vet ./... && go test -count=1 ./... && \
+          go test -race -count=1 ./... && \
+          go test -tags jseeksafe -count=1 ./... && \
+          go test -tags purego -count=1 ./...
+
   fuzz-smoke:
     name: fuzz smoke (${{ matrix.os }})
     needs: [test]
@@ -67,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -87,7 +119,16 @@ jobs:
             FuzzDocumentMatchesGet
             FuzzTapeMatchesGet
             FuzzEachKeyMatchesGet
+            FuzzEachDocMatchesEachKey
+            FuzzSetAgainstStdlib
+            FuzzDeleteAgainstStdlib
+            FuzzStreamMatchesArrayEach
+            FuzzStreamBytesMatchesDecoder
             FuzzPinMatchesGet
+            FuzzTransposeMatchesGet
+            FuzzValidMatchesStdlib
+            FuzzCountMatchesStdlib
+            FuzzFormatMatchesStdlib
           )
           for t in "${targets[@]}"; do
             echo "::group::seed $t"
@@ -105,12 +146,57 @@ jobs:
             FuzzTapeMatchesGet
             FuzzEachKeyMatchesGet
             FuzzPinMatchesGet
+            FuzzValidMatchesStdlib
+            FuzzCountMatchesStdlib
+            FuzzFormatMatchesStdlib
           )
           for t in "${targets[@]}"; do
             echo "::group::fuzz $t"
             go test -run=^$ -fuzz="^${t}$" -fuzztime=3s .
             echo "::endgroup::"
           done
+
+  qemu-arm64:
+    name: test (linux/arm64 via QEMU)
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build + test + safe + purego on arm64
+        # -race is skipped here: QEMU exposes a 47-bit VMA and ThreadSanitizer
+        # requires 48 ("unsupported VMA range"). Race coverage comes from the
+        # ubuntu hard gate and native arm64 runs (test-macos when available).
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src -e GOFLAGS=-buildvcs=false golang:1.23 \
+            sh -c 'go build ./... && go vet ./... && go test ./... -count=1 && go test -tags jseeksafe ./... -count=1 && go test -tags purego ./... -count=1'
+
+  bench-compat:
+    name: bench module differential gates
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: |
+            bench/go.mod
+            bench/go.sum
+      - name: Differential tests vs gjson/jsonparser/sonic
+        working-directory: bench
+        run: go test -count=1 ./...
+      - name: gjson query-compat fuzz smoke (informational)
+        continue-on-error: true
+        working-directory: bench
+        run: go test -run=^$ -fuzz=FuzzQueryMatchesGJSON -fuzztime=10s .
 
   bench:
     name: benchmark (informational)
@@ -138,10 +224,14 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test]
+    needs: [test, qemu-arm64, bench-compat]
     runs-on: ubuntu-latest
     steps:
-      - name: Require test matrix green
+      - name: Require hard gates green
         run: |
           echo "test result: ${{ needs.test.result }}"
+          echo "qemu-arm64 result: ${{ needs.qemu-arm64.result }}"
+          echo "bench-compat result: ${{ needs.bench-compat.result }}"
           test "${{ needs.test.result }}" = "success"
+          test "${{ needs.qemu-arm64.result }}" = "success"
+          test "${{ needs.bench-compat.result }}" = "success"

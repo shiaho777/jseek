@@ -52,9 +52,20 @@ func decodePointerToken(tok string) string {
 // jseek's native key path. Both bracket indices ("a[0]") and bare numeric
 // segments interpreted as indices ("a.0") are supported. Dots inside a segment
 // can be escaped with a backslash ("a\.b" is one key "a.b").
+//
+// A trailing ".#" (or a bare "#") is a count marker: GetPath/Get on such a
+// path return the number of elements/members of the container at the prefix
+// path as a Number value. "#" elsewhere in a path is an ordinary key byte.
 func ParseDotPath(path string) []string {
 	if path == "" {
 		return nil
+	}
+	if path == "#" || strings.HasSuffix(path, ".#") {
+		prefix := ParseDotPath(strings.TrimSuffix(path, "#"))
+		if len(prefix) > 0 && prefix[len(prefix)-1] == "" {
+			prefix = prefix[:len(prefix)-1]
+		}
+		return append(prefix, countSeg)
 	}
 	var out []string
 	var cur strings.Builder
@@ -113,8 +124,117 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// maxStackSegs bounds the stack-resident segment buffer used by the zero-
+// allocation path queries. Deeper or escaped paths fall back to the allocating
+// parsers, which handle arbitrary depth.
+const maxStackSegs = 16
+
+// parseDotPathInto parses a dotted path into dst without allocating, provided
+// the path needs no escape decoding, no bare-numeric index conversion, and at
+// most cap(dst) segments. It returns the segments and true on success; on
+// false the caller must fall back to ParseDotPath (dst contents are then
+// undefined). Semantics match ParseDotPath exactly for the accepted subset.
+func parseDotPathInto(dst []string, path string) ([]string, bool) {
+	if path == "" {
+		return dst[:0], true
+	}
+	count := false
+	if path == "#" || strings.HasSuffix(path, ".#") {
+		count = true
+		path = strings.TrimSuffix(path, "#")
+		path = strings.TrimSuffix(path, ".")
+	}
+	out := dst[:0]
+	segStart := 0
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '\\':
+			return nil, false // escape decoding needs a fresh string
+		case '.':
+			if i > segStart {
+				if len(out) == cap(dst) || isAllDigits(path[segStart:i]) {
+					return nil, false
+				}
+				out = append(out, path[segStart:i])
+			}
+			segStart = i + 1
+		case '[':
+			if i > segStart {
+				if len(out) == cap(dst) || isAllDigits(path[segStart:i]) {
+					return nil, false
+				}
+				out = append(out, path[segStart:i])
+			}
+			j := strings.IndexByte(path[i:], ']')
+			if j < 0 {
+				return nil, false // unclosed bracket: literal, needs builder
+			}
+			if len(out) == cap(dst) {
+				return nil, false
+			}
+			out = append(out, path[i:i+j+1])
+			i += j
+			segStart = i + 1
+		}
+	}
+	if len(path) > segStart {
+		if len(out) == cap(dst) || isAllDigits(path[segStart:]) {
+			return nil, false
+		}
+		out = append(out, path[segStart:])
+	}
+	if count {
+		if len(out) == cap(dst) {
+			return nil, false
+		}
+		out = append(out, countSeg)
+	}
+	return out, true
+}
+
+// parsePointerInto is the zero-allocation counterpart of ParsePointer for
+// pointers with no ~ escapes and at most cap(dst) tokens. Numeric tokens need
+// bracket wrapping and fall back to the allocating parser.
+func parsePointerInto(dst []string, pointer string) ([]string, bool, error) {
+	if pointer == "" {
+		return dst[:0], true, nil
+	}
+	if pointer[0] != '/' {
+		return nil, false, &PathError{Err: ErrMalformedJSON, At: -1, Offset: 0, Got: Unknown, Want: Unknown}
+	}
+	out := dst[:0]
+	rest := pointer[1:]
+	for {
+		j := strings.IndexByte(rest, '/')
+		tok := rest
+		if j >= 0 {
+			tok = rest[:j]
+		}
+		if strings.IndexByte(tok, '~') >= 0 || isAllDigits(tok) {
+			return nil, false, nil
+		}
+		if len(out) == cap(dst) {
+			return nil, false, nil
+		}
+		out = append(out, tok)
+		if j < 0 {
+			break
+		}
+		rest = rest[j+1:]
+	}
+	return out, true, nil
+}
+
 // GetPointer extracts the value addressed by an RFC 6901 JSON Pointer.
+// Simple pointers (no ~ escapes, at most 16 tokens) are resolved without
+// allocating.
 func GetPointer(data []byte, pointer string) (value []byte, dataType ValueType, offset int, err error) {
+	var buf [maxStackSegs]string
+	if keys, ok, perr := parsePointerInto(buf[:0], pointer); perr != nil {
+		return nil, NotExist, 0, perr
+	} else if ok {
+		return Get(data, keys...)
+	}
 	keys, perr := ParsePointer(pointer)
 	if perr != nil {
 		return nil, NotExist, 0, perr
@@ -123,12 +243,31 @@ func GetPointer(data []byte, pointer string) (value []byte, dataType ValueType, 
 }
 
 // GetPath extracts the value addressed by a dotted path like "a.b[0].c".
+// Simple paths (no escapes or bare numeric segments, at most 16 segments) are
+// resolved without allocating.
 func GetPath(data []byte, path string) (value []byte, dataType ValueType, offset int, err error) {
-	return Get(data, ParseDotPath(path)...)
+	var buf [maxStackSegs]string
+	if keys, ok := parseDotPathInto(buf[:0], path); ok {
+		if n := len(keys); n > 0 && keys[n-1] == countSeg {
+			return countPathResult(data, keys[:n-1])
+		}
+		return Get(data, keys...)
+	}
+	keys := ParseDotPath(path)
+	if n := len(keys); n > 0 && keys[n-1] == countSeg {
+		return countPathResult(data, keys[:n-1])
+	}
+	return Get(data, keys...)
 }
 
 // GetPointer on an indexed Document.
 func (d *Document) GetPointer(pointer string) (value []byte, dataType ValueType, offset int, err error) {
+	var buf [maxStackSegs]string
+	if keys, ok, perr := parsePointerInto(buf[:0], pointer); perr != nil {
+		return nil, NotExist, 0, perr
+	} else if ok {
+		return d.Get(keys...)
+	}
 	keys, perr := ParsePointer(pointer)
 	if perr != nil {
 		return nil, NotExist, 0, perr
@@ -138,5 +277,16 @@ func (d *Document) GetPointer(pointer string) (value []byte, dataType ValueType,
 
 // GetPath on an indexed Document.
 func (d *Document) GetPath(path string) (value []byte, dataType ValueType, offset int, err error) {
-	return d.Get(ParseDotPath(path)...)
+	var buf [maxStackSegs]string
+	if keys, ok := parseDotPathInto(buf[:0], path); ok {
+		if n := len(keys); n > 0 && keys[n-1] == countSeg {
+			return d.countPathResult(keys[:n-1])
+		}
+		return d.Get(keys...)
+	}
+	keys := ParseDotPath(path)
+	if n := len(keys); n > 0 && keys[n-1] == countSeg {
+		return d.countPathResult(keys[:n-1])
+	}
+	return d.Get(keys...)
 }

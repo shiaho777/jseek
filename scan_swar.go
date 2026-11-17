@@ -13,8 +13,34 @@ func broadcast(c byte) uint64 {
 	return uint64(c) * swarLSB
 }
 
+// zeroByteMask marks candidate zero bytes in v with the classic SWAR trick.
+// It never misses a true zero byte, but its borrow chain can over-report
+// non-zero bytes (0x01 above a zero passes the borrow through; 0x80 catches
+// it on the high bit — even in words with no zero at all). Callers that
+// re-check the located byte (quote/backslash/structural scanners) are safe
+// with the raw mask and keep its short dependency chain; callers that trust
+// the mask directly (whitespace, wide-key terminators) must use
+// zeroByteMaskExact instead.
 func zeroByteMask(v uint64) uint64 {
 	return (v - swarLSB) & ^v & swarMSB
+}
+
+// zeroByteMaskExact marks the high bit of every zero byte in v with no false
+// positives. The classic trick's borrow chain can flag non-zero bytes even
+// in words containing no zero at all (any 0x80 byte above a byte < 0x01,
+// common with UTF-8 text), so masks that are trusted without a per-byte
+// re-check must use this variant.
+//
+// The classic mask is a superset of the true zeros, so when it is 0 the word
+// has no zero byte and we return immediately — the common case inside string
+// bodies pays only the short classic chain. Otherwise the exact formula
+// ^(v | ((v | MSB) - LSB)) & MSB refines it; its borrow can only clear a high
+// bit that v already sets, so it never creates a false mark.
+func zeroByteMaskExact(v uint64) uint64 {
+	if (v-swarLSB)&^v&swarMSB == 0 {
+		return 0
+	}
+	return ^(v | ((v | swarMSB) - swarLSB)) & swarMSB
 }
 
 func quoteBackslashMask(v, quote, back uint64) uint64 {
@@ -115,10 +141,10 @@ func indexSkipWhitespaceSWAR(data []byte, i int) int {
 }
 
 func nonWhitespaceMask(v uint64) uint64 {
-	isSpace := zeroByteMask(v ^ broadcast(' '))
-	isTab := zeroByteMask(v ^ broadcast('\t'))
-	isNL := zeroByteMask(v ^ broadcast('\n'))
-	isCR := zeroByteMask(v ^ broadcast('\r'))
+	isSpace := zeroByteMaskExact(v ^ broadcast(' '))
+	isTab := zeroByteMaskExact(v ^ broadcast('\t'))
+	isNL := zeroByteMaskExact(v ^ broadcast('\n'))
+	isCR := zeroByteMaskExact(v ^ broadcast('\r'))
 	ws := isSpace | isTab | isNL | isCR
 	return ^ws & swarMSB
 }

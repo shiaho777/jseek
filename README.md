@@ -24,6 +24,51 @@ n, _    := jseek.GetInt(data, "user", "followers")      // 42
 tag, _  := jseek.GetString(data, "tags", "[1]")         // "b"
 ```
 
+## The `jseek` CLI — jq's job, at lazy-extraction speed
+
+jseek ships a **single static binary with zero runtime dependencies** that
+queries, filters, streams, validates, and formats JSON from your terminal:
+
+```sh
+go install github.com/shiaho777/jseek/cmd/jseek@latest
+# or grab a prebuilt binary (linux/darwin/windows, amd64/arm64) from Releases:
+#   https://github.com/shiaho777/jseek/releases
+
+jseek user.name config.json                 # extract a field
+jseek 'users.#.name' api.json               # every element's name
+jseek 'users.#(age>30)#.email' api.json     # filtered, all matches
+jseek '..name' api.json                     # recursive descent (any depth)
+jseek 'nums[1:3]' api.json                  # array slice ([-2:] from end)
+jseek -n 'latency_ms' logs.ndjson           # stream 200k log lines, bounded memory
+jseek -n -p 8 'events.#.k' heavy.ndjson     # parallel workers (order preserved)
+jseek -c big.json                           # minify
+jseek -i big.json                           # pretty-print
+jseek -v untrusted.json                     # validate (exit 0/1)
+jseek -v -strict untrusted.json             # + reject bad UTF-8/surrogates/dup keys
+cat api.json | jseek 'users[0].name'        # stdin
+```
+
+`-p N` parallelizes per-line NDJSON work with order preserved. It pays off for
+compute-heavy queries (e.g. `events.#.k` over 200-event records: ~1.8× at 4
+workers on a 124 MB file); trivial field reads are I/O-bound and stay fastest
+at `-p 1`.
+
+**Measured against `jq 1.7.1` on real files** (Apple M4 Pro, output verified
+byte-identical to jq):
+
+| Task | file | jseek | jq | speedup |
+| --- | --- | --- | --- | --- |
+| Extract one field | 7.5 MB JSON | **0.02 s** | 0.38 s | **~19×** |
+| Harvest 50 000 names (`users.#.name`) | 7.5 MB JSON | **0.03 s** | 0.48 s | **~16×** |
+| Filter + project (`age>60` → email) | 7.5 MB JSON | **0.03 s** | 0.47 s | **~15×** |
+| Stream 200 000 NDJSON lines | 17.6 MB | **0.05 s** | 0.92 s | **~18×** |
+| Minify (`-c`) | 7.5 MB JSON | **0.02 s** | 1.51 s | **~75×** |
+
+jq parses the whole document into a tree on every invocation; jseek walks only
+the bytes each query needs. The gap widens with document size. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology and the library-level
+comparisons against gjson/jsonparser/sonic.
+
 ## State of the art for lazy JSON extraction
 
 JSON libraries fall into two camps:
@@ -326,6 +371,103 @@ jseek.GetPointer(data, "/users/1/name")  // RFC 6901 JSON Pointer
 Both are also available on an indexed `Document` (`doc.GetPath`,
 `doc.GetPointer`).
 
+### Validation (`Valid`)
+
+Gateway primitive: check untrusted input once, then extract with the lazy API.
+`Valid` reports whether the input is exactly one well-formed JSON value
+(literal spelling, number grammar, escape legality, container structure). It
+agrees with `encoding/json.Valid` on all inputs — like the stdlib it is a
+syntax check, so lone surrogates and invalid UTF-8 inside strings are accepted
+(decoders replace them later). Zero allocation.
+
+```go
+if !jseek.Valid(body) {
+    // reject malformed input before doing any work
+}
+name, _ := jseek.GetString(body, "user", "name")
+```
+
+Measured ~1.0 GB/s on a 22 KB document (Apple M4 Pro), 0 allocs.
+
+`ValidStrict` adds the safety defaults popularized by `encoding/json/v2`:
+it additionally rejects invalid UTF-8, lone/unpaired surrogate escapes, and
+duplicate object member names. Use it at trust boundaries where ambiguous
+input must be refused rather than silently reinterpreted:
+
+```go
+if !jseek.ValidStrict(untrusted) {
+    // reject: bad UTF-8, lone surrogates, or duplicate keys
+}
+```
+
+`ValidStrict` is a strict subset of `Valid` (anything it accepts also passes
+`Valid` and decodes cleanly with the stdlib). It allocates only for the
+duplicate-key check; scalar/array validation stays zero-allocation. The CLI
+exposes it as `jseek -v -strict`.
+
+### Counting (`Count`, `#` paths)
+
+`Count` returns the number of array elements or object members at a path
+without materializing anything — zero allocation:
+
+```go
+n, _ := jseek.Count(data, "users")          // len(users)
+m, _ := jseek.Count(data)                   // top-level member count
+```
+
+Dotted paths support a trailing `.#` count marker, and `GetPath` returns the
+count as a `Number` value:
+
+```go
+v, _, _, _ := jseek.GetPath(data, "users.#")   // e.g. []byte("500")
+n, _ := jseek.GetInt(data, "users", jseek.CountSeg) // native segment form
+```
+
+A literal `"#"` object key stays addressable via the native segment form
+(`Get(data, "#")`); the count marker is an internal sentinel that cannot
+collide with real keys.
+
+### Wildcard & filter queries (`Query` / `QueryFirst`)
+
+gjson-compatible shape queries for harvesting many values at once:
+
+```go
+names, _ := jseek.Query(data, "users.#.name")          // every element's name
+first, _, _ := jseek.QueryFirst(data, "users.#(age>30).name") // first match
+admins, _ := jseek.Query(data, "users.#(active==true)#.email") // ALL matches
+n, _     := jseek.Query(data, "users.#")               // array length
+```
+
+- `#` mid-path iterates array elements; terminal `users.#` is the count.
+- `#(key op value)` filters elements (`== != > >= < <=`; strings, numbers,
+  bools, null; bare key = existence). Default continues with the **first**
+  match (gjson semantics); append `#` — `#(...)#` — for **all** matches.
+  Combine with `&&` / `||` (`&&` binds tighter): `#(age>30 && active==true)#`.
+- `..key` is recursive descent (jq-style): every member named `key` at any
+  depth — `..name`, `users..address.city`.
+- `[start:end]` slices arrays (jq/Python-style); bounds optional, negatives
+  count from the end: `nums[1:3]`, `nums[:2]`, `nums[-2:]`.
+- `*` is a jseek extension: like `#` but also iterates object members.
+
+Measured on 500 records (Apple M4 Pro): `users.#.name` **~19 µs / 33 KB**
+vs gjson ~64 µs / 151 KB (**~3.3× faster, ~4.6× less memory**); filtered
+all-matches ~37 µs vs ~62 µs. Semantics are cross-checked against gjson by
+`TestQueryMatchesGJSON` / `FuzzQueryMatchesGJSON` (bench/) and against jq
+byte-for-byte for the advanced forms; `FuzzQueryAdvancedNoPanic` guards the
+recursive/slice/compound paths.
+
+### Formatting (`Compact` / `Indent`)
+
+Re-serialize JSON without decoding it into Go values — the primitives behind
+`jseek -c` / `jseek -i`. Both validate structure, never mutate the input, and
+match `encoding/json.Compact` / `json.Indent` byte-for-byte (guarded by
+`FuzzFormatMatchesStdlib`):
+
+```go
+min, _ := jseek.Compact(data)        // strip insignificant whitespace
+pretty, _ := jseek.Indent(data, "  ") // 2-space pretty-print
+```
+
 ### Errors
 
 The fast getters return bare sentinel errors (`ErrKeyPathNotFound`,
@@ -386,8 +528,8 @@ element, not the whole stream, and each element is a self-contained value you
 can run the full jseek API on (including `Index`).
 
 ```go
-dec := jseek.NewDecoder(resp.Body)       // JSON arrays / mixed values
-// dec := jseek.NewNDJSONDecoder(resp.Body) // JSON Lines / NDJSON (faster)
+dec := jseek.NewDecoder(resp.Body)       // arrays / NDJSON / mixed values
+defer dec.Close()                        // return the pooled read buffer
 err := dec.ForEach(func(elem []byte) error {
     name, _ := jseek.GetString(elem, "user", "name")
     // ... process one record; elem is valid only for this call
@@ -395,10 +537,14 @@ err := dec.ForEach(func(elem []byte) error {
 })
 ```
 
-`NewDecoder` auto-detects `[...]` arrays versus whitespace-separated values.
-For known NDJSON / JSON Lines over `io.Reader`, use `NewNDJSONDecoder` (line mode,
-no value-framing tax). Set `Decoder.MaxValue` to cap per-element size and reject hostile input
-with `ErrTooLarge`.
+`NewDecoder` auto-detects the stream shape: `[...]` arrays, whitespace-separated
+values, **and NDJSON** — after the first value, a following newline switches it
+to line mode automatically, so the generic decoder is now the fastest NDJSON
+Reader path too (~1.44 ms vs gjson ~1.74 ms on 5000 log lines). `NewNDJSONDecoder`
+forces line mode from the start. Read buffers are pooled (`sync.Pool`): call
+`Close` (or reuse via `Reset`) so per-request construction adds ~0 allocations
+instead of a fresh 256 KiB bufio. Set `Decoder.MaxValue` to cap per-element size
+and reject hostile input with `ErrTooLarge`.
 
 When the whole input is already in memory, `StreamBytes` walks it with
 **zero allocation and zero copy** (each element aliases the input):
@@ -509,6 +655,11 @@ UTF-8). Correctness is enforced by **differential fuzz tests against
   `Get`, even after rebinding to a differently-shaped document.
 - `FuzzTransposeMatchesGet` — every cell of every transposed column equals a
   stateless `Get` on that record, across arbitrary mixed-shape batches.
+- `FuzzValidMatchesStdlib` — `Valid` agrees with `encoding/json.Valid` on
+  every input, valid or malformed.
+- `FuzzCountMatchesStdlib` — `Count` equals the cardinality of a full stdlib
+  decode on valid JSON (duplicate-key inputs excluded, per the first-wins
+  contract).
 
 Each has been run for tens of millions of executions with no divergences on
 in-contract input.
@@ -540,10 +691,15 @@ The full feature set is in place and rigorously tested: the lazy `Get` family,
 sibling-field `GetFields`/`EachField`, the "index once, query many" engine
 (`Index`/`IndexTape`), `Pin` and columnar `Transpose` for repeated access,
 multi-path `EachKey`/`GetMany`, generic accessors, `Set`/`Delete` mutation,
-dotted-path and JSON Pointer syntaxes, contextual errors, and memory-bounded
-streaming (`Decoder`/`StreamBytes`/`StreamNDJSON`). Navigation includes FASS equal-size array
-strides; scanning includes portable SWAR plus shipped AVX2/NEON kernels (opt out
-with `-tags purego`).
+dotted-path and JSON Pointer syntaxes (with `.#` count paths), contextual
+errors, zero-allocation `Valid` and `Count`, gjson-compatible wildcard/filter
+queries (`Query`/`QueryFirst`), and memory-bounded streaming
+(`Decoder`/`StreamBytes`/`StreamNDJSON`). Navigation includes FASS equal-size
+array strides and a SWAR wide-key compare for long keys; scanning includes
+portable SWAR plus shipped AVX2/NEON kernels (opt out with `-tags purego`).
+The SWAR whitespace mask uses an exact zero-byte detector, closing a
+borrow-chain false-positive class that could mis-skip bytes adjacent to
+spaces (guarded by exhaustive property tests and differential fuzzing).
 
 Correctness is enforced by differential fuzz tests against `encoding/json` and
 across jseek's own engines (tens of millions of executions each). CI's required
@@ -586,6 +742,7 @@ Representative results on an Apple M4 Pro (lower is better):
 
 `jseek` leads the lazy class on single-field, multi-path, deep homogeneous arrays
 (FASS), STE Stage-1, topology stride, and IndexTape reuse — all **zero allocation**. Deep `users[250]` (~3.1 µs) and GitHub-style issue arrays (~6.0 µs cold) are both
-ahead of sonic's arm64 path; cold Index multi-get now leads both FASS re-scan and sonic. NDJSON log harvest with `StreamNDJSONEach` leads
-gjson on the former weak spot (~1.11 ms vs ~1.73 ms / 5000 lines). See
+ahead of sonic's arm64 path; cold Index multi-get now leads both FASS re-scan and sonic. **Every NDJSON path now beats gjson**: in-memory
+`StreamNDJSONEach` ~1.11 ms, and the generic `NewDecoder` (auto-detecting NDJSON) ~1.44 ms vs gjson ~1.74 ms / 5000 lines — the former
+generic-framing weak spot is closed. See
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for full boundaries and methodology.

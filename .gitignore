@@ -1,6 +1,11 @@
 # Compiled test/benchmark binaries
 *.test
 
+# CLI build output
+/jseek
+/jseek.exe
+/dist/
+
 # Profiling output
 *.out
 *.prof

@@ -173,19 +173,24 @@ after STE; for a handful of cold fields prefer stateless.
 | --- | --- | --- |
 | jseek `StreamNDJSONEach` (line split + multi-path, early exit) | **1.11 ms** | 0 B |
 | jseek `NewNDJSONDecoder` + `Reset` + `Paths.Each` | **1.10 ms** | **51 B / 1 alloc** |
-| jseek `NewNDJSONDecoder` + `Paths.Each` (new each time) | 1.18 ms | 263 KB (bufio once) |
+| jseek `NewNDJSONDecoder` + `Paths.Each` (new each time, pooled) | 1.14 ms | ~0 B steady-state |
 | jseek `StreamBytes` + `EachKey` | 1.28 ms | 0 B |
 | jseek `StreamNDJSON` + 3×`Get` | 1.30 ms | 0 B |
-| jseek `NewNDJSONDecoder` + 3×`Get` | 1.37 ms | 263 KB |
+| jseek `NewDecoder` (auto-detects NDJSON → line mode) | **1.44 ms** | 66 KB |
+| jseek `NewNDJSONDecoder` + 3×`Get` | 1.52 ms | ~0 B steady-state |
 | jseek `StreamBytes` + 3×`Get` | 1.54 ms | 0 B |
-| gjson (pre-split lines + 3×`Get`) | 1.73 ms | 0 B |
-| jseek `NewDecoder` (generic value framing) | 2.17 ms | 66 KB |
+| gjson (pre-split lines + 3×`Get`) | 1.74 ms | 0 B |
 
-**Takeaway:** in-memory and `io.Reader` NDJSON are both closed as weak spots.
-`StreamNDJSONEach` is the zero-alloc in-memory lead (**~1.6× gjson**).
-`NewNDJSONDecoder` + `Reset` matches it on the Reader path within noise while
-keeping the bufio window warm. Multi-path early-exit still skips trailing junk
-keys.
+**Takeaway:** every NDJSON path now beats gjson. The former weak spot —
+`NewDecoder`'s generic value framing at 2.17 ms (slower than gjson's 1.73 ms)
+— is closed: it now auto-detects a newline-delimited stream after the first
+value and switches to line mode, landing at **~1.44 ms (~1.2× faster than
+gjson)**. `NewNDJSONDecoder` buffers are pooled (`sync.Pool`), so per-request
+construction no longer allocates a fresh 256 KiB bufio each time; with `Close`
+or `Reset` reuse the steady-state allocation is ~0 (guarded by
+`TestDecoderReuseZeroAlloc`). `StreamNDJSONEach` remains the zero-alloc
+in-memory lead (**~1.6× gjson**). Multi-path early-exit still skips trailing
+junk keys.
 ---
 
 ## Result 6b: Stage-1 index build — Structural Template Expansion (STE)
@@ -283,6 +288,125 @@ issue/user arrays. NDJSON is a lead via `StreamNDJSON` / `NewNDJSONDecoder`
 7. **Topology-constant array stride** — indexed deep `arr[N]` jumps by structural step when element topologies match (digit growth OK).
 8. **`NewNDJSONDecoder`** — line-mode Reader path for JSON Lines without full value framing.
 9. **Structural Template Expansion (STE)** — synthesize Stage-1 structurals for equal-size object-array runs; skip interior re-scan.
+
+## 2026-11 round: wide-key compare, division-free ints, exact whitespace mask
+
+Same-binary A/B on Apple M4 Pro (go1.23.4, `-benchtime=300ms`, medians of 2–3):
+
+| Micro | before | after | note |
+| --- | --- | --- | --- |
+| `scanKey`, 33-byte key | ~31 ns | ~19.5 ns | SWAR 8-byte compare + exact terminator mask; scalar kept below 16-byte targets |
+| `scanKey`, 4-byte key | ~4.7 ns | ~5.2 ns | one extra length branch; within noise on full workloads |
+| `GetInt`, 19-digit value | ~36 ns | ~31 ns | digit-count overflow bound replaces per-digit division |
+
+Full-workload fixtures (Small / LargeShallow / LargeIndexed / ArrayEach /
+GitHub / ManyFields / EachKey) are unchanged within run-to-run noise
+(±5–10% thermal variance on this machine); an early wide-key threshold of
+8 bytes measurably regressed short-key workloads (~10%) and was raised to
+16 bytes after A/B isolation.
+
+New zero-allocation APIs measured on the same machine:
+
+| API | fixture | time | allocs |
+| --- | --- | --- | --- |
+| `Valid` | 22 KB mixed doc | ~21.5 µs (~1.0 GB/s) | 0 |
+| `Count` | 500-element object array | ~5.3 µs | 0 |
+| `GetPath` / `GetPointer`, simple paths | small doc | same as `Get` | **0** (was 1+ per call for the segment slice) |
+
+Correctness note: the SWAR whitespace mask previously used the classic
+zero-byte trick, whose borrow chain can misread a byte adjacent to a space
+(e.g. `'!'`) as whitespace. The exact detector (`zeroByteMaskExact`) closes
+this class; it was found by the new `FuzzValidMatchesStdlib` differential
+fuzzer and is guarded by exhaustive mask property tests. Quote/backslash and
+structural masks keep the classic trick because they re-check the located
+byte; A/B showed no measurable cost either way on the full fixtures.
+
+## 2026-11 round 2: wildcard/filter queries, GetString single copy
+
+New gjson-compatible query surface (`Query`/`QueryFirst`), 500 records,
+Apple M4 Pro, `-benchtime=300ms`, medians of 2:
+
+| Scenario | jseek | gjson | ratio |
+| --- | --- | --- | --- |
+| `users.#.name` (all 500) | **~21 µs / 33 KB / 15 allocs** | ~68 µs / 151 KB / 36 allocs | ~3.2× faster, ~4.6× less memory |
+| `users.#(age>40)#.name` (filtered, all) | **~37 µs / 16 KB** | ~62 µs / 67 KB | ~1.7× faster, ~4× less memory |
+
+Semantics match gjson where gjson defines them (`#` array wildcard,
+`#(...)` first-match, `#(...)#` all-matches, terminal `#` count); `*`
+iterating object members is a documented jseek extension. Differential
+gates: `TestQueryMatchesGJSON` + `FuzzQueryMatchesGJSON` (bench module).
+
+`GetString` now decodes into one right-sized buffer instead of
+append-then-copy: ~80 ns → ~70 ns on a 68-byte UA string (same 2 allocs;
+the second is the runtime's string conversion, unavoidable for an immutable
+decoded string).
+
+**Recorded negative result:** a SWAR wide-compare for `keyMatches`
+(multi-path key equality) was prototyped three ways — exact terminator
+masks, compare-first with escape check on divergence, and varied thresholds
+(16/32 bytes). All measured **slower** than the scalar loop even on 93-byte
+keys: target-key loads are unaligned and the per-call safety check outweighs
+the word-at-a-time gain. Reverted; the scalar loop stays. (`scanKey`'s fused
+scan+compare wide path is a different shape and remains a win.)
+
+## 2026-11 round 3: the CLI, and head-to-head vs jq on real files
+
+jseek now ships `cmd/jseek` — a single static binary (query / filter / stream /
+validate / compact / indent). Compared against **jq 1.7.1** on generated real
+files, wall-clock via `/usr/bin/time -p`, outputs verified **byte-identical**
+(`diff` on 50 000-line wildcard harvest and on minified output):
+
+| Task | fixture | jseek | jq | speedup |
+| --- | --- | --- | --- | --- |
+| `meta.version` (one field) | 7.5 MB, 50 000 users | 0.02 s | 0.38 s | ~19× |
+| `users.#.name` (all names) | 7.5 MB | 0.03 s | 0.48 s | ~16× |
+| `users.#(age>60)#.email` | 7.5 MB | 0.03 s | 0.47 s | ~15× |
+| `-n latency_ms` (NDJSON) | 17.6 MB, 200 000 lines | 0.05 s | 0.92 s | ~18× |
+| `-c` (minify) | 7.5 MB | 0.02 s | 1.51 s | ~75× |
+
+Why: jq builds a full in-memory tree per invocation; jseek's lazy walker touches
+only the bytes a query needs, and the CLI streams NDJSON with bounded memory.
+Single-field extraction is ~0.01–0.02 s regardless of document size (the field
+is near the front), while jq's cost scales with the whole document.
+
+New library APIs backing the CLI: `Compact` / `Indent` (match stdlib
+byte-for-byte, `FuzzFormatMatchesStdlib`), `QueryTyped` (typed results so a
+string `"42"` is never confused with the number `42`).
+
+## 2026-11 round 4: advanced query syntax, strict validation, parallel NDJSON
+
+Driven by a frontier survey (simdjson v5.2 On-Demand, Go 1.27 json/v2, jaq 3.x,
+Glaze SWAR-first, Pison parallel indexing). Shipped the high-ROI items:
+
+**Query expressiveness** (jq-compatible, output verified byte-identical to jq):
+recursive descent `..key`, array slices `[start:end]` with negative bounds,
+compound filters `#(a && b || c)#` with correct `&&`-over-`||` precedence.
+Guarded by `FuzzQueryAdvancedNoPanic` (4.9M execs) + jq cross-checks. Core
+harvest unchanged: `users.#.name` ~19 µs vs gjson ~64 µs (~3.3×).
+
+**`ValidStrict`**: json/v2-style safety defaults (reject invalid UTF-8, lone
+surrogates, duplicate keys). Strict subset of `Valid`; zero-alloc on
+scalars/arrays, allocates only for the duplicate-key map. CLI: `-v -strict`.
+
+**CLI parallel NDJSON (`-p N`)**: read/process/write pipeline, order preserved.
+Measured on a 124 MB file (20 000 lines × 200 events), query `events.#.k`:
+
+| workers | time |
+| --- | --- |
+| 1 | 0.29 s |
+| 2 | 0.21 s |
+| 4 | **0.16 s (~1.8×)** |
+| 8 | 0.18 s |
+
+**Recorded boundary:** parallelism only pays for compute-heavy per-line work.
+Trivial field reads (`latency_ms`) are I/O-bound: `-p 1` 0.29 s vs `-p 8` 0.35 s
+(coordination overhead dominates). The flag is documented accordingly; default
+stays 1. Large single-doc queries remain ~7–23× faster than jq (`..city`:
+0.01 s vs 0.23 s on 50 000 records).
+
+**Deferred (honest):** `jsontext` interop needs Go 1.27 (local toolchain is
+1.23.4 — cannot verify, so not shipped blind); Pison-style parallel structural
+indexing and arm64 SVE kernels need hardware/CI this machine lacks.
 
 ## Discipline about the numbers
 

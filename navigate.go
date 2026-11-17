@@ -15,6 +15,14 @@ func keyMatches(data []byte, start, end int, key string) bool {
 	// each byte exactly once. The moment we see a backslash we hand off to the
 	// escape-aware comparator for the remainder.
 	n := end - start
+	if n != len(key) {
+		return false
+	}
+	// A SWAR wide-compare variant was prototyped here and measured slower
+	// than this scalar loop even on 90+ byte keys: the target-key loads are
+	// unaligned and the per-call safety check outweighs the word-at-a-time
+	// gain. (scanKey's fused scan+compare wide path is a different shape and
+	// does win — see scanKeyWide.)
 	ki := 0
 	for j := 0; j < n; j++ {
 		c := data[start+j]
@@ -35,13 +43,95 @@ func keyMatches(data []byte, start, end int, key string) bool {
 // returns the index just past the closing quote, whether the key matched, and
 // whether the scan succeeded.
 //
-// This fuses what would otherwise be two passes (skipString + keyMatches) and
-// uses a scalar inner loop: object keys are typically short, so the per-call
-// setup of the SWAR scanner does not amortize and a tight scalar compare with
-// early mismatch bail is faster. Values, which can be long, still use the SWAR
-// skipString. On encountering an escape it defers to the exact escape-aware
-// comparison.
+// This fuses what would otherwise be two passes (skipString + keyMatches).
+// Targets shorter than 16 bytes keep the tight scalar compare with early
+// mismatch bail: the wide path's per-call setup does not amortize below that
+// (measured). Longer targets compare eight bytes per step with SWAR: a key
+// whose bytes are known to be ordinary (no quote, backslash, or control byte)
+// can only end at a quote or backslash in the document, so one register mask
+// locates the next candidate terminator while a single word comparison
+// validates all eight content bytes at once. On encountering an escape it
+// defers to the exact escape-aware comparison.
 func scanKey(data []byte, i int, key string) (keyEnd int, matched bool, ok bool) {
+	if len(key) >= 16 && keyIsWideSafe(key) {
+		return scanKeyWide(data, i, key)
+	}
+	return scanKeyScalar(data, i, key)
+}
+
+// keyIsWideSafe reports whether every byte of key is an ordinary content byte
+// (>= 0x20, not '"' or '\\'). For such targets the document key can only
+// terminate at a quote or backslash, which lets scanKeyWide skip the
+// per-byte terminator checks inside the bulk loop. Scalar with early bail:
+// keys with an exceptional byte usually reveal it in the first few bytes.
+func keyIsWideSafe(key string) bool {
+	for j := 0; j < len(key); j++ {
+		c := key[j]
+		if c < 0x20 || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+func scanKeyWide(data []byte, i int, key string) (keyEnd int, matched bool, ok bool) {
+	n := len(data)
+	p := i + 1
+	klen := len(key)
+	quote := broadcast('"')
+	back := broadcast('\\')
+	for klen-(p-i-1) >= 8 && p+8 <= n {
+		v := load64(data, p)
+		// Exact masks: the classic trick false-positives on 0x80 bytes
+		// (common in UTF-8 keys), which would truncate the scan early.
+		if zeroByteMaskExact(v^quote)|zeroByteMaskExact(v^back) != 0 {
+			break
+		}
+		if v != load64str(key, p-i-1) {
+			// Content diverges: the key cannot match, but its extent must
+			// still be scanned so navigation can skip the value.
+			j := indexQuoteOrBackslash(data, p)
+			if j < 0 {
+				return n, false, false
+			}
+			if data[j] == '"' {
+				return j + 1, false, true
+			}
+			// Backslash at j: resume the body scan past the escape pair.
+			ke, sok := skipStringBody(data, j+2)
+			return ke, false, sok
+		}
+		p += 8
+	}
+	// Scalar tail: fewer than 8 target bytes remain, or a quote/backslash
+	// landed inside the next word. Same semantics as the short-key path.
+	ki := p - i - 1
+	matched = true
+	for p < n {
+		c := data[p]
+		if c == '"' {
+			return p + 1, matched && ki == klen, true
+		}
+		if c == '\\' {
+			ke, sok := skipString(data, i)
+			if !sok {
+				return ke, false, false
+			}
+			return ke, escapedEquals(data[i+1:ke-1], key), true
+		}
+		if matched {
+			if ki >= klen || key[ki] != c {
+				matched = false
+			} else {
+				ki++
+			}
+		}
+		p++
+	}
+	return p, false, false
+}
+
+func scanKeyScalar(data []byte, i int, key string) (keyEnd int, matched bool, ok bool) {
 	n := len(data)
 	p := i + 1
 	ki := 0
