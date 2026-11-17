@@ -69,6 +69,44 @@ the bytes each query needs. The gap widens with document size. See
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology and the library-level
 comparisons against gjson/jsonparser/sonic.
 
+## Beyond extraction: a zero-parse JSON data substrate
+
+jseek's structural index is a compact, pointer-free array — which means it can
+be **persisted once and re-opened by any process with zero re-parsing**. This
+turns jseek from a per-request extractor into an embeddable, shareable JSON
+storage layer: the "SQLite of JSON" for applications that store JSON and read
+fields from it repeatedly (config stores, document caches, IPC shared state,
+edge-device state, feature stores).
+
+```go
+// Writer process: build the index once, seal it to disk.
+d := jseek.IndexTape(data)
+d.Persist(indexFile)            // alongside the raw .json payload
+
+// Reader process (any process, any time): map once, verify once…
+jseek.VerifyIndex(idxBytes, data)
+// …then open in O(1) and query, forever, with no re-scan:
+doc, _ := jseek.ViewTrusted(idxBytes, data)
+rps, _ := doc.GetInt("config", "limits", "rps")
+```
+
+**Measured** (Apple M4 Pro, 27 KB doc, open + deep query):
+
+| Path | time | allocs |
+| --- | --- | --- |
+| Rebuild index from bytes (every process today) | ~20 µs | 109 KB |
+| `ViewTrusted` after one-time `VerifyIndex` | **~138 ns** | **128 B** |
+
+**~145× faster open, ~850× less memory.** A cross-process demo (writer seals
+`store.json` + `store.jix`; reader maps and queries) sustains **100 000
+opens + 2-field queries at ~229 ns each**. The index is bound to its payload
+by a 64-bit hash, so a stale or tampered pairing is rejected (`ErrBadIndex`).
+
+APIs: `Document.Persist`, `Open` (streaming, verifies hash), `View` /
+`ViewTrusted` (zero-copy over resident/mmap'd bytes), `VerifyIndex`,
+`Document.IndexSize`. The zero-copy view reinterprets the index arrays in
+place (default build); `-tags jseeksafe` decodes them safely instead.
+
 ## State of the art for lazy JSON extraction
 
 JSON libraries fall into two camps:

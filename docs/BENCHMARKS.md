@@ -408,6 +408,38 @@ stays 1. Large single-doc queries remain ~7–23× faster than jq (`..city`:
 1.23.4 — cannot verify, so not shipped blind); Pison-style parallel structural
 indexing and arm64 SVE kernels need hardware/CI this machine lacks.
 
+## 2026-11 round 5: persistent index — the zero-parse data substrate
+
+The strategic breakthrough: jseek's Stage-1 index is a pointer-free []uint32,
+so it can be persisted and re-opened with ZERO re-scanning. This moves jseek
+from "fast per-process extractor" toward "embeddable, shareable JSON storage"
+(the SQLite-of-JSON direction). New APIs: Document.Persist, Open, View,
+ViewTrusted, VerifyIndex, IndexSize.
+
+Measured (Apple M4 Pro, 27 KB doc, open + deep GetInt), same-binary A/B:
+
+| Path | time | allocs |
+| --- | --- | --- |
+| RebuildIndexTape (re-scan every open) | ~20 µs | 109 KB / 7 |
+| Open (streaming decode + hash) | ~41 µs | 74 KB / 7 |
+| View (zero-copy + per-open hash) | ~27.6 µs | 128 B / 1 |
+| **ViewTrusted after one VerifyIndex** | **~138 ns** | **128 B / 1** |
+
+The canonical mmap pattern (map once → VerifyIndex once → ViewTrusted many)
+is **~145× faster and ~850× less allocating** than rebuilding. Cross-process
+demo: writer seals store.json + store.jix; reader maps and sustains 100 000
+opens + 2-field queries at ~229 ns each.
+
+**Honest boundaries:**
+- Index overhead is ~217% of payload WITH tape (structural ~108% + tape ~108%);
+  plain Index (no tape) is ~108%. The substrate trades disk for zero-parse opens.
+- ViewTrusted skips the per-open hash by design — it requires a one-time
+  VerifyIndex on an immutable mapping. View (default) still hashes per open.
+- The win is on REPEATED opens of STABLE data. For one-shot reads of changing
+  data, stateless Get / Index remains the right tool.
+- -tags jseeksafe decodes the arrays (3 allocs) instead of zero-copy
+  reinterpreting; the guarantee there is safety, not zero allocation.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

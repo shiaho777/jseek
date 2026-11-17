@@ -7,6 +7,13 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Persistent structural index — zero-parse data substrate**: `Document.Persist`,
+  `Open`, `View`, `ViewTrusted`, `VerifyIndex`, `IndexSize`. The pointer-free
+  index is sealed to disk once and re-opened by any process with no re-scan;
+  the canonical mmap pattern (verify once, then `ViewTrusted`) opens in ~138 ns
+  / 128 B vs ~20 µs / 109 KB to rebuild (~145× / ~850×). Cross-process demo
+  sustains 100k opens+queries at ~229 ns. Payload bound by 64-bit hash;
+  zero-copy reinterpretation in the default build, safe decode under `jseeksafe`.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;
