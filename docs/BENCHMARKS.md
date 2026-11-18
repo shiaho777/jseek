@@ -723,6 +723,46 @@ Proven by crash-injection tests: truncated trailing record, flipped value byte
 These are durability guarantees, not benchmark wins — recorded because a store
 that loses data is not a store, however fast it reads.
 
+## Round 10 — field index: from fast scan to actual index
+
+Round 9's query engine was a *fast scan*: allocation-free and zero-parse, but a
+WHERE still visited every record. Round 10 adds a real index so a selective query
+touches only the matching records.
+
+`SealNDJSONIndexed` keeps, per indexed field, a sorted table of (value, recordID).
+A comparison binary-searches the value band to a contiguous record-ID set;
+multiple predicates intersect their sets (smallest first); only survivors are
+evaluated against the full predicate.
+
+100 000 records, 1% selectivity (`status == "error"` matches 1 000), Apple M4 Pro,
+`-benchtime=500ms -count=3`:
+
+| Path | time | allocs |
+|---|---|---|
+| Full scan (no index) | ~4.1 ms | 1 |
+| Field index (selective) | ~60 µs | 7 |
+
+**~68×** on the selective query. The index costs ~8 KB of candidate-set allocation
+per query (the record-ID slices); the scan stays zero-alloc. Non-selective queries
+fall back to the scan, so the index never makes a query slower by more than the
+lookup overhead.
+
+Two bugs the differential tests caught and fixed:
+- the last record's index slice ran to `len(image)`, which now includes the
+  trailing field-index section — fixed with an explicit record-index-region end;
+- candidate sets came back value-sorted but the intersection assumed record-ID
+  order — fixed by sorting candidates by record ID.
+
+Correctness: `TestFieldIndexMatchesScan` checks indexed == scan across every
+operator/type and multi-predicate conjunctions; `FuzzFieldIndexMatchesScan`
+differential-fuzzes it (6.7M+ execs, zero divergence). `AppendNDJSON` preserves
+and rebuilds the index. Full matrix + race + safe + purego + cross green.
+
+**Honest boundary:** the index is per-field equality/range, built at seal time;
+it is not a general query planner (no join, no composite-key optimization, no
+automatic index selection). Appending rebuilds the whole field-index section
+(O(records)); a truly incremental index merge is future work.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

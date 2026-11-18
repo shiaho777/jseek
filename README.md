@@ -217,11 +217,18 @@ out, _ := s.SelectJSON(w, []string{"id", "latency_ms"}, 10) // projected NDJSON
 ```
 
 ```sh
+jseek -seal-n logs.ndjson logs.njstore -index status,region   # build a field index
 jseek -q logs.njstore -where 'latency_ms > 100 && status == "error"' \
       -select id,latency_ms -limit 10
 jseek -q logs.njstore -where 'status == "error"' -agg latency_ms
 jseek -q logs.njstore -agg latency_ms -group region
 ```
+
+With `-index`, a selective WHERE binary-searches the field index and evaluates
+only matching records: on a 1%-selective query over 100k records, **~60 µs vs
+~4.1 ms full scan (~68×)**. Without an index (or for non-selective queries) it
+falls back to the zero-parse scan — never slower. Indexed results are
+differential-fuzzed to equal the scan exactly.
 
 **Measured** (100 000 records, Apple M4 Pro): filtered count ~5 ms / **0 allocs**,
 aggregation ~6.3 ms, group-by ~9.8 ms / 11 allocs (group-count-bound). A full

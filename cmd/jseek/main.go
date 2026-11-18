@@ -54,6 +54,7 @@ func main() {
 		seal     = flag.Bool("seal", false, "build a self-contained zero-parse store: jseek -seal in.json out.jstore")
 		open     = flag.Bool("open", false, "query a sealed store with zero re-parsing: jseek -open store.jstore 'path'")
 		sealN    = flag.Bool("seal-n", false, "build a random-access NDJSON store: jseek -seal-n in.ndjson out.njstore")
+		indexF   = flag.String("index", "", "with -seal-n: comma-separated fields to index for fast WHERE (e.g. -index status,region)")
 		openN    = flag.Bool("open-n", false, "query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]")
 		appendN  = flag.Bool("append-n", false, "append records: jseek -append-n store.njstore new.ndjson")
 		at       = flag.Int("at", -1, "with -open-n: select a single record by index (0-based)")
@@ -86,7 +87,7 @@ func main() {
 		os.Exit(runOpenStore(flag.Args(), *raw, *count))
 	}
 	if *sealN {
-		os.Exit(runSealNDJSON(flag.Args()))
+		os.Exit(runSealNDJSON(flag.Args(), *indexF))
 	}
 	if *openN {
 		os.Exit(runOpenNDJSON(flag.Args(), *raw, *count, *at))
@@ -320,11 +321,31 @@ func runOpenStore(args []string, raw, count bool) int {
 	return 0
 }
 
-// runSealNDJSON: jseek -seal-n in.ndjson out.njstore
-func runSealNDJSON(args []string) int {
+// runSealNDJSON: jseek -seal-n in.ndjson out.njstore [-index f1,f2]
+func runSealNDJSON(args []string, indexFields string) int {
+	// Extract a trailing "-index f1,f2" even after positional args.
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-index" && i+1 < len(args) {
+			indexFields = args[i+1]
+			i++
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	args = rest
 	if len(args) != 2 {
 		fmt.Fprintln(os.Stderr, "jseek: -seal-n needs <input.ndjson> <output.njstore>")
 		return 2
+	}
+	var fields []string
+	if indexFields != "" {
+		for _, f := range strings.Split(indexFields, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fields = append(fields, f)
+			}
+		}
 	}
 	in, err := os.Open(args[0])
 	if err != nil {
@@ -339,7 +360,7 @@ func runSealNDJSON(args []string) int {
 	}
 	defer out.Close()
 	bw := bufio.NewWriter(out)
-	n, err := jseek.SealNDJSON(bw, in)
+	n, err := jseek.SealNDJSONIndexed(bw, in, fields)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "jseek:", err)
 		return 1

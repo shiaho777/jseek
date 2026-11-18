@@ -7,6 +7,16 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Field index — queries skip non-matching records** (`ndjson_fieldindex.go`):
+  `SealNDJSONIndexed(w, r, fields)` builds an optional trailing sorted-value
+  index per field; a WHERE comparison resolves to a record-ID set by binary
+  search, multiple predicates intersect their sets, and only survivors are
+  evaluated. On a 1%-selective query over 100k records: **~60 µs vs ~4.1 ms full
+  scan (~68×)**; non-selective queries fall back to the scan, never worse.
+  Stores without the index parse and query exactly as before (header flag bit0);
+  `AppendNDJSON` preserves and rebuilds the index. CLI: `jseek -seal-n in.ndjson
+  out.njstore -index status,region`. Differential-fuzzed indexed-vs-scan
+  (`FuzzFieldIndexMatchesScan`, 6.7M+ execs, zero divergence).
 - **NDJSON query engine** (`ndjson_query.go`): record-level WHERE filtering,
   projection, and aggregation (count/sum/avg/min/max + group-by) over the
   zero-parse random-access store — `SELECT fields FROM records WHERE cond

@@ -3,6 +3,7 @@ package jseek
 import (
 	"bytes"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -207,6 +208,95 @@ func (w Where) match(d *Document) bool {
 	return true
 }
 
+// candidates returns the sorted record IDs that may match w, using the field
+// index when available. if nil, the caller must scan every record. When the
+// index proves no record can match, it returns an empty (non-nil) slice.
+//
+// Strategy: resolve each indexed predicate to a record-ID set by binary search,
+// then intersect the sets (smallest first). Unindexed predicates are left for
+// per-record evaluation. If no predicate is indexed, fall back to a full scan.
+func (s *NDJSONStore) candidates(w Where) []uint64 {
+	if len(s.fields) == 0 || len(w) == 0 {
+		return nil
+	}
+	var sets [][]uint64
+	for i := range w {
+		p := &w[i]
+		f := s.lookupField(strings.Join(p.Path, "."))
+		if f == nil {
+			continue // unindexed predicate: evaluate per record
+		}
+		set, ok := f.candidateRange(p.Op, p.Want)
+		if !ok {
+			continue
+		}
+		sets = append(sets, set)
+	}
+	if len(sets) == 0 {
+		return nil // nothing indexed: scan
+	}
+	// Intersect, smallest set first to minimize work.
+	sort.Slice(sets, func(i, j int) bool { return len(sets[i]) < len(sets[j]) })
+	cur := sets[0]
+	for _, next := range sets[1:] {
+		cur = intersectSorted(cur, next)
+		if len(cur) == 0 {
+			break
+		}
+	}
+	if cur == nil {
+		cur = []uint64{}
+	}
+	return cur
+}
+
+// intersectSorted returns the sorted intersection of two sorted uint64 slices.
+func intersectSorted(a, b []uint64) []uint64 {
+	out := make([]uint64, 0, min(len(a), len(b)))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+// forEachMatch visits every record matching w, using the field index to skip
+// non-candidates when possible. The Document is reused (zero alloc per record).
+func (s *NDJSONStore) forEachMatch(w Where, fn func(i int, d *Document) bool) error {
+	cands := s.candidates(w)
+	var d Document
+	if cands == nil {
+		for i := 0; i < s.n; i++ {
+			if _, err := s.RecordInto(&d, i); err != nil {
+				return err
+			}
+			if w.match(&d) && !fn(i, &d) {
+				return nil
+			}
+		}
+		return nil
+	}
+	for _, rec := range cands {
+		i := int(rec)
+		if _, err := s.RecordInto(&d, i); err != nil {
+			return err
+		}
+		if w.match(&d) && !fn(i, &d) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // Select iterates records matching w, projecting the given dotted field paths
 // (nil/empty projects the whole record). fn receives the record index and the
 // projected raw JSON values in order; return false to stop early. Projection
@@ -216,20 +306,10 @@ func (s *NDJSONStore) Select(w Where, fields []string, fn func(i int, vals [][]b
 	for i, f := range fields {
 		paths[i] = ParseDotPath(f)
 	}
-	var d Document
-	for i := 0; i < s.n; i++ {
-		if _, err := s.RecordInto(&d, i); err != nil {
-			return err
-		}
-		if !w.match(&d) {
-			continue
-		}
+	return s.forEachMatch(w, func(i int, d *Document) bool {
 		if len(paths) == 0 {
 			raw, _ := s.Raw(i)
-			if !fn(i, [][]byte{raw}, []ValueType{Object}) {
-				return nil
-			}
-			continue
+			return fn(i, [][]byte{raw}, []ValueType{Object})
 		}
 		vals := make([][]byte, len(paths))
 		types := make([]ValueType, len(paths))
@@ -241,11 +321,8 @@ func (s *NDJSONStore) Select(w Where, fields []string, fn func(i int, vals [][]b
 				vals[j], types[j] = v, vt
 			}
 		}
-		if !fn(i, vals, types) {
-			return nil
-		}
-	}
-	return nil
+		return fn(i, vals, types)
+	})
 }
 
 // writeJSONValue renders an extracted value as a standalone JSON token. Strings
@@ -269,16 +346,11 @@ func writeJSONValue(buf *bytes.Buffer, v []byte, vt ValueType) {
 // only the WHERE fields per record — no projection, no allocation.
 func (s *NDJSONStore) Count(w Where) (int, error) {
 	n := 0
-	var d Document
-	for i := 0; i < s.n; i++ {
-		if _, err := s.RecordInto(&d, i); err != nil {
-			return 0, err
-		}
-		if w.match(&d) {
-			n++
-		}
-	}
-	return n, nil
+	err := s.forEachMatch(w, func(i int, d *Document) bool {
+		n++
+		return true
+	})
+	return n, err
 }
 
 // Aggregate is the result of a numeric aggregation over matching records.
@@ -304,22 +376,15 @@ func (a Aggregate) Avg() float64 {
 func (s *NDJSONStore) Aggregate(w Where, field string) (Aggregate, error) {
 	path := ParseDotPath(field)
 	agg := Aggregate{Min: math.Inf(1), Max: math.Inf(-1)}
-	var d Document
-	for i := 0; i < s.n; i++ {
-		if _, err := s.RecordInto(&d, i); err != nil {
-			return Aggregate{}, err
-		}
-		if !w.match(&d) {
-			continue
-		}
+	err := s.forEachMatch(w, func(i int, d *Document) bool {
 		agg.Count++
 		v, vt, _, err := d.Get(path...)
 		if err != nil || vt != Number {
-			continue
+			return true
 		}
 		f, err := parseFloat(v)
 		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-			continue
+			return true
 		}
 		agg.N++
 		agg.Sum += f
@@ -329,6 +394,10 @@ func (s *NDJSONStore) Aggregate(w Where, field string) (Aggregate, error) {
 		if f > agg.Max {
 			agg.Max = f
 		}
+		return true
+	})
+	if err != nil {
+		return Aggregate{}, err
 	}
 	if agg.N == 0 {
 		agg.Min, agg.Max = math.NaN(), math.NaN()
@@ -345,18 +414,11 @@ func (s *NDJSONStore) GroupAggregate(w Where, groupField, aggField string) (map[
 	apath := ParseDotPath(aggField)
 	out := make(map[string]Aggregate)
 	intern := make(map[string]string) // canonical stable key per group
-	var d Document
-	var scratch []byte // reusable decode buffer for string group keys
-	for i := 0; i < s.n; i++ {
-		if _, err := s.RecordInto(&d, i); err != nil {
-			return nil, err
-		}
-		if !w.match(&d) {
-			continue
-		}
+	var scratch []byte                // reusable decode buffer for string group keys
+	err := s.forEachMatch(w, func(i int, d *Document) bool {
 		gv, gvt, _, err := d.Get(gpath...)
 		if err != nil {
-			continue
+			return true
 		}
 		// Render the group key into scratch (strings decoded, others raw). Both
 		// the intern lookup and the aggregate lookup use string(scratch), which
@@ -391,6 +453,10 @@ func (s *NDJSONStore) GroupAggregate(w Where, groupField, aggField string) (map[
 			}
 		}
 		out[key] = agg
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
 	for k, agg := range out {
 		if agg.N == 0 {
