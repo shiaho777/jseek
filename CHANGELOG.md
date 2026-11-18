@@ -44,6 +44,12 @@ tagged releases begin.
   size** (100→50 000 records all ~160–186 ns). Optional WAL file for crash-safe
   replay; `Compact` folds the log into a new base. CLI: `-wal` +
   `-wset`/`-wdel`/`-wget`/`-wcompact`. Guarded by `FuzzWALMatchesMaterialize`.
+- **Generation-keyed materialization cache (breaks the dirty-read boundary)**:
+  repeated reads of an overlay-dirtied subtree are now O(1) (~93 ns / 24 B) vs
+  O(document) per read before (~1.15 ms / 934 KB) — ~12,000× for read-after-write
+  patterns. The cache rebuilds only when the edit set changes (append/compact
+  bumps a generation counter). First dirty read after an edit still materializes;
+  truly incremental subtree materialization is deferred.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

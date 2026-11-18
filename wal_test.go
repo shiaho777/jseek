@@ -228,6 +228,92 @@ func FuzzWALMatchesMaterialize(f *testing.F) {
 	})
 }
 
+// TestWALMaterializeCacheInvalidation verifies the cached materialization is
+// rebuilt when edits change and reused otherwise.
+func TestWALMaterializeCacheInvalidation(t *testing.T) {
+	path, _ := walBase(t)
+	w, err := OpenWAL(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.Set([]byte(`11`), "users", "[1]", "score")
+	arr, _, _ := w.Get("users")
+	if v, _ := GetInt(arr, "[1]", "score"); v != 11 {
+		t.Fatalf("first read score=%d", v)
+	}
+	arr2, _, _ := w.Get("users")
+	if v, _ := GetInt(arr2, "[1]", "score"); v != 11 {
+		t.Fatalf("cached read score=%d", v)
+	}
+	w.Set([]byte(`22`), "users", "[2]", "score")
+	arr3, _, _ := w.Get("users")
+	if v, _ := GetInt(arr3, "[2]", "score"); v != 22 {
+		t.Fatalf("post-edit read score=%d (cache not invalidated?)", v)
+	}
+	if v, _ := GetInt(arr3, "[1]", "score"); v != 11 {
+		t.Fatalf("post-edit prior edit lost score=%d", v)
+	}
+	w.Compact()
+	arr4, _, _ := w.Get("users")
+	if v, _ := GetInt(arr4, "[2]", "score"); v != 22 {
+		t.Fatalf("post-compact score=%d", v)
+	}
+}
+
+// BenchmarkWALDirtyRead measures repeated reads of an overlay-dirtied subtree:
+// without the cache each read materializes the whole document; with it, only
+// the first does. This is the boundary-breaking measurement.
+func BenchmarkWALDirtyRead(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString(`{"cfg":{"v":1},"items":[`)
+	for i := 0; i < 5000; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(`{"id":`)
+		sb.WriteString(itoa(i))
+		sb.WriteString(`,"desc":"a long description string number `)
+		sb.WriteString(itoa(i))
+		sb.WriteString(`","ok":true}`)
+	}
+	sb.WriteString(`]}`)
+	data := []byte(sb.String())
+	dir := b.TempDir()
+	bp := filepath.Join(dir, "b.jstore")
+	fh, _ := os.Create(bp)
+	Seal(fh, data)
+	fh.Close()
+	w, err := OpenWAL(bp, "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer w.Close()
+	w.Set([]byte(`false`), "items", "[2500]", "ok")
+	b.Run("CachedRepeatedRead", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			v, _, err := w.Get("items", "[2500]", "ok")
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = v
+		}
+	})
+	b.Run("FreshMaterializeEachRead", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			doc, err := buildMaterialized(w.base, w.edits)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, _, _, err := Get(doc, "items", "[2500]", "ok"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // BenchmarkWALWrite is the breakthrough measurement: a cheap overlay write vs
 // a full payload-rewriting Set on a large document.
 func BenchmarkWALWrite(b *testing.B) {

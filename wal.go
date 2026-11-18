@@ -54,6 +54,14 @@ type WALStore struct {
 	// wal, if set, is the file the edit log is persisted to (append-only).
 	wal     *os.File
 	walPath string
+	// gen bumps on every mutation (append/compact/replay). matGen records the
+	// generation matDoc was built at; a dirty-subtree read reuses matDoc when
+	// matGen == gen, making repeated reads O(1) instead of O(document).
+	gen    uint64
+	matMu  sync.Mutex
+	matGen uint64
+	matDoc []byte
+	matErr error
 }
 
 // OpenWAL opens a sealed base for cheap writes. If walPath is non-empty, the
@@ -190,6 +198,7 @@ func (w *WALStore) append(e walEdit) error {
 	idx := len(w.edits)
 	w.edits = append(w.edits, e)
 	w.latest[e.path] = idx
+	w.gen++
 	return nil
 }
 
@@ -254,13 +263,30 @@ func (w *WALStore) Get(keys ...string) ([]byte, ValueType, error) {
 	return v, vt, err
 }
 
-// materialize applies all pending edits to a copy of the base payload and
-// returns the resulting JSON. Used only for subtree reads the overlay affects.
+// materialize returns base + all pending edits as JSON. The result is cached
+// against the edit generation: repeated dirty-subtree reads reuse it in O(1),
+// and it is rebuilt only when a write/compact changes the edit set. This breaks
+// the "every dirty read is O(document)" boundary for read-after-write workloads.
+// The returned slice is shared and must be treated as read-only by callers.
 func (w *WALStore) materialize() ([]byte, error) {
 	w.mu.RLock()
+	gen := w.gen
 	edits := append([]walEdit(nil), w.edits...)
 	base := w.base
 	w.mu.RUnlock()
+
+	w.matMu.Lock()
+	defer w.matMu.Unlock()
+	if w.matGen == gen && w.matDoc != nil {
+		return w.matDoc, w.matErr
+	}
+	doc, err := buildMaterialized(base, edits)
+	w.matGen, w.matDoc, w.matErr = gen, doc, err
+	return doc, err
+}
+
+// buildMaterialized applies edits to a copy of the base payload.
+func buildMaterialized(base *Store, edits []walEdit) ([]byte, error) {
 	d, err := base.View()
 	if err != nil {
 		return nil, err
@@ -361,6 +387,7 @@ func (w *WALStore) Compact() error {
 	w.base = nb
 	w.edits = nil
 	w.latest = make(map[string]int)
+	w.gen++
 	if w.wal != nil {
 		if err := w.wal.Truncate(0); err != nil {
 			return err

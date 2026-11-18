@@ -149,10 +149,13 @@ jseek -wal edits.wal -wcompact base.jstore new.jstore
 
 **Measured** (5000-record ~330 KB doc): WAL write **~180 ns / ~300 B** vs a full
 rewrite **~82 µs / 344 KB** (~450×), and **flat across document sizes** (100 /
-5 000 / 50 000 records all ~160–186 ns). Reads of an overlay-dirtied subtree
-materialize on demand; exact-path and unaffected reads stay zero-parse.
-Compaction is the one O(document) step, amortized over many writes. Optional WAL
-file gives crash-safe replay. Guarded by `FuzzWALMatchesMaterialize`.
+5 000 / 50 000 records all ~160–186 ns). Exact-path and unaffected reads stay
+zero-parse. Reads of an overlay-dirtied subtree are served from a
+**generation-keyed materialization cache**: repeated reads are **~93 ns / 24 B**
+(vs ~1.15 ms / 934 KB to materialize every time, ~12,000×) — the cache rebuilds
+only when the edit set changes. Compaction is the one O(document) step, amortized
+over many writes. Optional WAL file gives crash-safe replay. Guarded by
+`FuzzWALMatchesMaterialize`.
 
 ### NDJSON random-access store
 

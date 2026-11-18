@@ -559,16 +559,47 @@ The write touches only the edit, never the payload. This is genuinely cheap
 writes — the thing round 8 said needed a redesign, achieved instead by changing
 the *write model* (append-only overlay) rather than the payload format.
 
-**Honest boundaries:**
-- Reads of an overlay-dirtied subtree materialize (O(document)) — the cost moves
-  from every write to occasional reads of edited subtrees + batched compaction.
-  Exact-path and unaffected-subtree reads stay zero-parse.
+**Honest boundaries (as of round 9; the first one is broken in round 10):**
+- ~~Reads of an overlay-dirtied subtree materialize (O(document)) every time.~~
+  → Round 10 caches the materialization against the edit generation: repeated
+  dirty-subtree reads are O(1); only the first read after an edit rebuilds.
 - The overlay is path-keyed; an edit's applicability is validated with a cheap
   O(path-depth) walk at write time (this is the ~180 ns, vs ~80 ns pure append).
 - Compaction is the one O(document) operation; amortize it over many writes.
 - Concurrent-safe (RWMutex); base mapping immutable. FuzzWALMatchesMaterialize
   gates overlay reads == fully materialized document (clean after fixing root /
   ancestor-prefix dirty detection found by the fuzzer).
+
+## 2026-11 round 10: breaking the dirty-read boundary — generation cache
+
+Round 9's remaining boundary: every read of an overlay-dirtied subtree
+materialized the whole document (O(document) per read). Round 10 breaks it with
+a **generation-keyed materialization cache**: WALStore tracks a `gen` counter
+bumped on every append/compact; `materialize` caches its result against `gen`
+and reuses it while the edit set is unchanged. Repeated dirty-subtree reads go
+from O(document) to O(1); the cost is paid once per edit-set change, not per read.
+
+**Measured (5000-record doc, one edit dirties the items subtree, read a field
+inside it), same-binary A/B:**
+
+| Read method | time | allocs |
+| --- | --- | --- |
+| Fresh materialize every read (round 9 behavior) | ~1.15 ms | 934 KB |
+| **Cached repeated read (round 10)** | **~93 ns** | **24 B** |
+
+**~12,000× faster, ~39,000× less memory** for the read-after-write pattern.
+Cache invalidation is exact: any append or compact bumps `gen`, forcing a
+rebuild on the next dirty read (TestWALMaterializeCacheInvalidation). The cache
+is guarded by its own mutex so reads build it without blocking writers; the
+returned slice is shared read-only. Race detector + FuzzWALMatchesMaterialize
+clean.
+
+**Remaining honest boundary:** the FIRST dirty read after each edit still
+materializes O(document), and a write-then-read-every-time workload rebuilds
+each time. The cache wins decisively for read-heavy / batched-read patterns
+(the common case); a truly incremental materialization (recompute only the
+edited subtree, not the whole doc) is the next step and is deferred — it needs
+subtree-splice surgery rather than full-document PatchSet.
 
 ## Discipline about the numbers
 
