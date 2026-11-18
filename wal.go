@@ -161,30 +161,77 @@ func (w *WALStore) checkApplicable(keys []string, isSet bool) error {
 		}
 	}
 	w.mu.RUnlock()
-	var data []byte
 	if dirty {
-		var err error
-		data, err = w.materialize()
+		// Rare: the overlay already changed this subtree, so validate against
+		// the materialized document with the full planner.
+		data, err := w.materialize()
 		if err != nil {
 			return err
 		}
-	} else {
-		data = base.Data()
-	}
-	start := skipWhitespace(data, 0)
-	if start >= len(data) {
-		// Empty base: Set synthesizes a document (allowed); Delete is a no-op.
+		start := skipWhitespace(data, 0)
+		if start >= len(data) {
+			if isSet {
+				return validateBuildKeys(keys)
+			}
+			return nil
+		}
 		if isSet {
-			return validateBuildKeys(keys)
+			_, err := planSet(data, start, keys)
+			return err
 		}
 		return nil
 	}
-	if isSet {
-		_, err := planSet(data, start, keys)
+	// Fast path: validate against the base using the structural index, so a
+	// deep array index is located by index stride — not an O(n) byte scan.
+	if !isSet {
+		return nil // Delete tolerates a missing path.
+	}
+	bd := base.Data()
+	if len(skipWhitespaceSlice(bd)) == 0 {
+		return validateBuildKeys(keys) // empty base: Set synthesizes objects
+	}
+	d, err := base.View()
+	if err != nil {
 		return err
 	}
-	// Delete tolerates a missing path (plain Delete returns the doc unchanged).
-	return nil
+	// If the full path resolves via the index, the edit replaces an existing
+	// value — always applicable. This uses indexed array strides (O(1)-ish).
+	if _, ok := d.seekIndexed(keys); ok {
+		return nil
+	}
+	// Path absent: find the deepest existing ancestor via the index, then the
+	// remaining (to-be-created) segments must be object keys only, and the
+	// ancestor must be an object (arrays are not extended, scalars cannot be
+	// descended). Walking prefixes uses indexed navigation, not byte scans.
+	existing := 0
+	for i := 1; i <= len(keys); i++ {
+		if _, ok := d.seekIndexed(keys[:i]); ok {
+			existing = i
+		} else {
+			break
+		}
+	}
+	if existing == 0 {
+		// No prefix resolves. If the root is a non-empty scalar, Set cannot
+		// descend into it (matches planSet's ErrUnexpectedType). Only an empty
+		// base allows synthesizing a fresh object document.
+		rstart := skipWhitespace(bd, 0)
+		if rstart < len(bd) && bd[rstart] != '{' {
+			return ErrUnexpectedType
+		}
+		return validateBuildKeys(keys)
+	}
+	astart, _ := d.seekIndexed(keys[:existing])
+	if astart >= len(bd) || bd[astart] != '{' {
+		return ErrKeyPathNotFound // cannot create under an array/scalar
+	}
+	return validateBuildKeys(keys[existing:])
+}
+
+// skipWhitespaceSlice returns data with leading JSON whitespace removed.
+func skipWhitespaceSlice(data []byte) []byte {
+	i := skipWhitespace(data, 0)
+	return data[i:]
 }
 
 func (w *WALStore) append(e walEdit) error {

@@ -54,6 +54,13 @@ tagged releases begin.
   allocation is flat regardless of document size. Locates the base subtree via
   the structural index; applies only descendant edits relative to it. Guarded by
   `FuzzWALMatchesMaterialize`.
+- **Indexed write validation (eliminates residual O(n))**: `checkApplicable`
+  now validates edits via the structural index (`seekIndexed` + deepest-existing
+  -ancestor walk) instead of the stateless byte scanner. Writes to a deep array
+  element are flat (~340–410 ns) across 100→50 000 records (was 314 ns→9.6 µs);
+  the first-dirty-read cycle is flat too (~1.1 µs). Matches `Set`'s accept/reject
+  decisions incl. nested creation under array elements and scalar-root rejection
+  (`TestWALApplicabilityNested`).
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

@@ -629,12 +629,47 @@ now scale with the *subtree*, not the document. The first-dirty-read
 O(document) boundary is broken.
 
 **Remaining honest note:** the residual time growth (1.1 → 11 µs across
-100 → 50 000) is structural-index navigation to locate the element, not copying;
+100 → 50 000) was structural-index navigation to locate the element, not copying;
 allocation is flat. A read of the ENTIRE dirty document (root) still assembles
 the whole thing — unavoidable, since the result IS the whole document. The
 breakthrough is that reading a *part* no longer pays for the *whole*.
 FuzzWALMatchesMaterialize clean (fixed root-read descendant collection found by
 the fuzzer); full matrix + race green.
+
+## 2026-11 round 12: indexed write validation — the residual O(n) eliminated
+
+Round 11 left a residual: writes to a deep array path still grew O(n) because
+`checkApplicable` validated via the **stateless** `planSet`/`findIndex`, which
+walks the array byte-by-byte from the start. (The round-11 read benchmark's
+time growth was actually this write-side cost, since it did a Set each iter.)
+
+Round 12 rewrites `checkApplicable`'s fast path to use the **structural index**:
+- full path resolves via `seekIndexed` (indexed array strides) → replace, OK;
+- else find the deepest existing ancestor by walking path prefixes through the
+  index, require it to be an object, and validate only the to-be-created tail
+  (object keys only; arrays not extended, scalars not descended).
+
+**Measured: write to a deep array element (`items[n/2].ok`), same-binary A/B:**
+
+| array size | before (stateless validate) | after (indexed validate) |
+| --- | --- | --- |
+| 100 | 314 ns | 370 ns |
+| 5 000 | 1.24 µs | 337 ns |
+| 50 000 | 9.63 µs | **408 ns** |
+
+Write cost is now **flat (~340–410 ns) regardless of array size**. And the
+first-dirty-read cycle (Set + read parent) is now flat too: 100→1.09 µs,
+5 000→1.11 µs, 50 000→1.15 µs (was 11 µs at 50 000). Both read and write scale
+with the subtree/edit, never the document.
+
+Correctness: the indexed validator matches `Set`'s accept/reject decisions,
+including nested creation under array elements and scalar-root rejection
+(TestWALApplicabilityNested + FuzzWALMatchesMaterialize, which caught a
+scalar-root edge). Full matrix + race green.
+
+**Remaining honest note:** reading the entire dirty root still assembles the
+whole document — logically unavoidable (the result IS the whole document).
+Every *partial* read and every write is now document-size-independent.
 
 ## Discipline about the numbers
 

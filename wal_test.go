@@ -314,6 +314,52 @@ func BenchmarkWALDirtyRead(b *testing.B) {
 	})
 }
 
+// TestWALApplicabilityNested guards the indexed write-validation against the
+// nested-creation edge cases the single-key fuzz does not reach.
+func TestWALApplicabilityNested(t *testing.T) {
+	dir := t.TempDir()
+	bp := filepath.Join(dir, "b.jstore")
+	fh, _ := os.Create(bp)
+	Seal(fh, []byte(`{"items":[{"id":0},{"id":1}],"obj":{"a":1}}`))
+	fh.Close()
+	w, err := OpenWAL(bp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	// Replace existing deep array field.
+	if err := w.Set([]byte(`9`), "items", "[1]", "id"); err != nil {
+		t.Errorf("replace deep array field: %v", err)
+	}
+	// Insert a new key under an existing array element (object parent).
+	if err := w.Set([]byte(`"x"`), "items", "[0]", "newkey"); err != nil {
+		t.Errorf("insert under array element: %v", err)
+	}
+	// Create a multi-level nested object under an array element.
+	if err := w.Set([]byte(`5`), "items", "[0]", "deep", "a", "b"); err != nil {
+		t.Errorf("nested create under array element: %v", err)
+	}
+	// Create a new top-level nested object.
+	if err := w.Set([]byte(`1`), "fresh", "x", "y"); err != nil {
+		t.Errorf("create top-level nested: %v", err)
+	}
+	// Array index out of range must be rejected (arrays not extended).
+	if err := w.Set([]byte(`1`), "items", "[99]", "id"); err == nil {
+		t.Error("out-of-range array index accepted")
+	}
+	// Descending into a scalar must be rejected.
+	if err := w.Set([]byte(`1`), "obj", "a", "b"); err == nil {
+		t.Error("descend into scalar accepted")
+	}
+	// Verify the accepted edits read back correctly via subtree resolution.
+	if v, err := w.GetInt("items", "[0]", "deep", "a", "b"); err != nil || v != 5 {
+		t.Errorf("nested create readback=%d err=%v", v, err)
+	}
+	if v, _, err := w.Get("items", "[0]", "newkey"); err != nil || string(v) != "x" {
+		t.Errorf("insert readback=%q err=%v", v, err)
+	}
+}
+
 // BenchmarkWALSubtreeFirstRead measures the FIRST dirty read (cache cold) of a
 // small field inside a large edited array. With subtree-local resolution it
 // should be ~constant regardless of array size; the old full-materialize path

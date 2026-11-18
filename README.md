@@ -148,12 +148,13 @@ jseek -wal edits.wal -wcompact base.jstore new.jstore
 ```
 
 **Measured** (5000-record ~330 KB doc): WAL write **~180 ns / ~300 B** vs a full
-rewrite **~82 µs / 344 KB** (~450×), and **flat across document sizes** (100 /
-5 000 / 50 000 records all ~160–186 ns). Exact-path and unaffected reads stay
+rewrite **~82 µs / 344 KB** (~450×). Writes are validated via the structural
+index, so a write to a deep array element is **flat (~340–410 ns) across
+100→50 000 records** — no O(n) byte scan. Exact-path and unaffected reads stay
 zero-parse. Dirty reads use **subtree-local resolution**: only the requested
 subtree + edits inside it are touched, never the whole document — a first dirty
-read of an element in a 50 000-record array is **~11 µs / 1.4 KB** vs ~103.7 ms /
-9.46 MB to materialize everything (~9,400×), with allocation flat regardless of
+read of an element in a 50 000-record array is **~1.1 µs / 1.5 KB** vs ~103.7 ms /
+9.46 MB to materialize everything, with time and allocation flat regardless of
 document size. Repeated dirty reads hit a **generation-keyed cache** (~93 ns /
 24 B). Compaction is the one O(document) step, amortized over many writes.
 Optional WAL file gives crash-safe replay. Guarded by `FuzzWALMatchesMaterialize`.
