@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jseek playground — zero-install JSON extraction</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#e6edf3;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--err:#f85149;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
+  header{padding:20px 24px;border-bottom:1px solid var(--border)}
+  header h1{margin:0;font-size:20px}
+  header h1 code{color:var(--acc);font-family:var(--mono)}
+  header p{margin:6px 0 0;color:var(--dim);font-size:13px}
+  .wrap{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 24px;max-width:1400px;margin:0 auto}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+  .panel h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+  textarea{width:100%;height:300px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:10px;font:13px var(--mono);resize:vertical}
+  input[type=text]{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:9px 10px;font:14px var(--mono)}
+  .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  button{background:var(--acc);color:#04121f;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:13px}
+  button.sec{background:var(--border);color:var(--fg)}
+  button:hover{filter:brightness(1.1)}
+  .out{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font:13px var(--mono);white-space:pre-wrap;word-break:break-word;min-height:120px;max-height:300px;overflow:auto;margin-top:10px}
+  .stat{display:flex;gap:18px;margin-top:10px;flex-wrap:wrap}
+  .stat div{font-size:13px;color:var(--dim)}
+  .stat b{color:var(--fg);font-family:var(--mono)}
+  .ok{color:var(--ok)} .err{color:var(--err)}
+  .examples{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap}
+  .examples button{background:transparent;border:1px solid var(--border);color:var(--acc);font-weight:400;padding:4px 9px;font-size:12px;font-family:var(--mono)}
+  .note{color:var(--dim);font-size:12px;margin-top:8px}
+  #status{font-size:12px;color:var(--dim);padding:0 24px 8px}
+  .badge{display:inline-block;background:var(--border);border-radius:4px;padding:1px 7px;font-size:11px;font-family:var(--mono);color:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <h1><code>jseek</code> playground</h1>
+  <p>Zero-install JSON extraction in your browser. Everything runs locally via WebAssembly — <b>no data leaves this page</b>. Same engine as the Go library &amp; CLI.</p>
+</header>
+<div id="status">loading WebAssembly engine…</div>
+<div class="wrap">
+  <div class="panel">
+    <h2>JSON input</h2>
+    <textarea id="data" spellcheck="false"></textarea>
+    <div class="examples" id="samples"></div>
+    <div class="stat">
+      <div>bytes <b id="bytes">0</b></div>
+      <div>valid <b id="valid">–</b></div>
+      <div>strict <b id="strict">–</b></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Query path</h2>
+    <input type="text" id="path" spellcheck="false" placeholder="users.#.name">
+    <div class="examples" id="paths"></div>
+    <div class="row">
+      <button id="run">Run query</button>
+      <button id="bench" class="sec">Benchmark ×1000</button>
+      <button id="count" class="sec">Count</button>
+    </div>
+    <div class="out" id="out">Results appear here.</div>
+    <div class="stat">
+      <div>matches <b id="matches">–</b></div>
+      <div>ns/op <b id="ns">–</b></div>
+      <div>µs total <b id="us">–</b></div>
+    </div>
+    <div class="note">Path syntax: <span class="badge">a.b</span> <span class="badge">users[0]</span> <span class="badge">users.#.name</span> <span class="badge">users.#(age&gt;30)#.name</span> <span class="badge">..name</span> <span class="badge">nums[1:3]</span> <span class="badge">users.#</span></div>
+  </div>
+</div>
+<script src="wasm_exec.js"></script>
+<script>
+const SAMPLES = {
+  "API response": {meta:{version:"1.4",total:3},users:[
+    {id:1,name:"Ada",age:36,active:true,tags:["admin","dev"]},
+    {id:2,name:"Bob",age:24,active:false,tags:["dev"]},
+    {id:3,name:"Cleo",age:41,active:true,tags:[]}]},
+  "Nested config": {service:{region:"us-east",limits:{rps:5000,burst:200}},features:{darkMode:true,beta:false}},
+  "Log lines (array)": [{ts:1,latency_ms:12,status:200},{ts:2,latency_ms:340,status:500},{ts:3,latency_ms:8,status:200}],
+};
+const PATHS = ["users.#.name","users.#(age>30)#.name","users[0].tags[0]","..name","users.#","meta.version"];
+const $ = id => document.getElementById(id);
+let ready = false;
+
+function loadSample(name){
+  $("data").value = JSON.stringify(SAMPLES[name], null, 2);
+  refresh();
+}
+function refresh(){
+  const d = $("data").value;
+  $("bytes").textContent = new Blob([d]).size;
+  if(!ready) return;
+  const v = jseek.valid(d);
+  $("valid").textContent = v.valid ? "yes" : "no";
+  $("valid").className = v.valid ? "ok":"err";
+  $("strict").textContent = v.strict ? "yes":"no";
+  $("strict").className = v.strict ? "ok":"err";
+}
+function run(){
+  if(!ready) return;
+  const r = jseek.query($("data").value, $("path").value);
+  if(r.error){ $("out").textContent = "error: "+r.error; $("out").className="out err"; $("matches").textContent="–"; return; }
+  $("out").className="out";
+  $("matches").textContent = r.results.length;
+  $("out").textContent = r.results.map(x=>x.raw).join("\n") || "(no matches)";
+}
+function bench(){
+  if(!ready) return;
+  const r = jseek.bench($("data").value, $("path").value, 1000);
+  if(r.error){ $("out").textContent="error: "+r.error; return; }
+  $("ns").textContent = r.nsPerOp;
+  $("us").textContent = (r.nsPerOp*r.iters/1000).toFixed(1);
+  $("matches").textContent = r.results;
+  $("out").textContent = `ran ${r.iters} iterations\n${r.nsPerOp} ns/op average\n${r.results} matches per query`;
+}
+function count(){
+  if(!ready) return;
+  const r = jseek.count($("data").value, $("path").value);
+  if(r.error){ $("out").textContent="error: "+r.error; return; }
+  $("out").textContent = "count = "+r.count;
+  $("matches").textContent = r.count;
+}
+
+// Build sample & path buttons.
+for(const name of Object.keys(SAMPLES)){
+  const b=document.createElement("button"); b.textContent=name;
+  b.onclick=()=>loadSample(name); $("samples").appendChild(b);
+}
+for(const p of PATHS){
+  const b=document.createElement("button"); b.textContent=p;
+  b.onclick=()=>{ $("path").value=p; run(); }; $("paths").appendChild(b);
+}
+$("run").onclick=run; $("bench").onclick=bench; $("count").onclick=count;
+$("data").addEventListener("input",refresh);
+$("path").addEventListener("keydown",e=>{ if(e.key==="Enter") run(); });
+
+// Boot WASM.
+const go = new Go();
+WebAssembly.instantiateStreaming(fetch("jseek.wasm"), go.importObject).then(res=>{
+  go.run(res.instance);
+});
+document.addEventListener("jseek-ready",()=>{
+  ready=true;
+  $("status").innerHTML = '<span class="ok">● engine ready</span> — '+jseek.version();
+  loadSample("API response");
+  $("path").value="users.#.name";
+  run();
+});
+</script>
+</body>
+</html>

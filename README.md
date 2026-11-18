@@ -24,6 +24,17 @@ n, _    := jseek.GetInt(data, "user", "followers")      // 42
 tag, _  := jseek.GetString(data, "tags", "[1]")         // "b"
 ```
 
+**Coming from gjson?** Switch engines with a one-line import change —
+`import gjson "github.com/shiaho777/jseek/gjsoncompat"` — and keep your existing
+`gjson.Get(...)` call sites. See [docs/MIGRATION.md](docs/MIGRATION.md) for the
+preserved API surface and the differential fuzzing against real gjson.
+
+**Try it without installing anything:** the [browser playground](playground/)
+runs the same engine via WebAssembly, entirely locally — no data leaves the
+page. Build it with `./scripts/build-playground.sh`, then serve `playground/`
+over http. Reproduce every headline number with
+[`./scripts/reproducible-bench.sh`](scripts/reproducible-bench.sh).
+
 ## The `jseek` CLI — jq's job, at lazy-extraction speed
 
 jseek ships a **single static binary with zero runtime dependencies** that
