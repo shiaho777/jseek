@@ -39,12 +39,28 @@ const (
 	ndjsonMagic   = "JSEEKNJ1"
 	ndjsonVersion = 1
 	ndjsonHeader  = 32
+	// ndjsonFlagFieldIndex marks an optional trailing field-index section that
+	// lets WHERE queries skip non-matching records via binary search.
+	ndjsonFlagFieldIndex = 1 << 0
 )
 
 // SealNDJSON builds a random-access store from NDJSON input (one JSON value per
 // line; blank lines skipped). Each record is validated and indexed with the
 // skip tape. Returns the number of records sealed.
 func SealNDJSON(w io.Writer, r io.Reader) (int, error) {
+	return sealNDJSON(w, r, nil)
+}
+
+// SealNDJSONIndexed is SealNDJSON plus a field index over the given dotted
+// fields. The index lets WHERE queries on those fields locate matching records
+// by binary search instead of scanning every record. Fields absent from a record
+// are simply not indexed for it. The index is an optional trailing section;
+// stores without it remain fully readable.
+func SealNDJSONIndexed(w io.Writer, r io.Reader, fields []string) (int, error) {
+	return sealNDJSON(w, r, fields)
+}
+
+func sealNDJSON(w io.Writer, r io.Reader, fields []string) (int, error) {
 	// First pass: collect raw records and their byte ranges.
 	var payload bytes.Buffer
 	var offsets []uint64
@@ -82,10 +98,14 @@ func SealNDJSON(w io.Writer, r io.Reader) (int, error) {
 	}
 
 	// Header.
+	var flags uint32
+	if len(fields) > 0 {
+		flags |= ndjsonFlagFieldIndex
+	}
 	var hdr [ndjsonHeader]byte
 	copy(hdr[0:8], ndjsonMagic)
 	binary.LittleEndian.PutUint32(hdr[8:12], ndjsonVersion)
-	binary.LittleEndian.PutUint32(hdr[12:16], 0)
+	binary.LittleEndian.PutUint32(hdr[12:16], flags)
 	binary.LittleEndian.PutUint64(hdr[16:24], uint64(n))
 	binary.LittleEndian.PutUint64(hdr[24:32], uint64(len(data)))
 	if _, err := w.Write(hdr[:]); err != nil {
@@ -106,6 +126,12 @@ func SealNDJSON(w io.Writer, r io.Reader) (int, error) {
 	// Per-record indexes.
 	for i := 0; i < n; i++ {
 		if err := docs[i].Persist(w); err != nil {
+			return 0, err
+		}
+	}
+	// Optional field-index section.
+	if len(fields) > 0 {
+		if err := writeFieldIndex(w, docs, fields); err != nil {
 			return 0, err
 		}
 	}
@@ -141,6 +167,11 @@ type NDJSONStore struct {
 	// idxOff[i] is the byte offset of record i's sealed index within image.
 	idxOff []uint64
 	n      int
+	// recIdxEnd is the byte offset just past the last per-record index (i.e.
+	// where the optional field-index section begins, or len(image) if none).
+	recIdxEnd uint64
+	// fields holds the optional field index (nil when the store has none).
+	fields []fieldIndex
 }
 
 // OpenNDJSONStore maps and validates a sealed NDJSON store.
@@ -174,9 +205,10 @@ func parseNDJSON(img []byte) (*NDJSONStore, error) {
 	if len(img) < ndjsonHeader || string(img[0:8]) != ndjsonMagic {
 		return nil, ErrBadIndex
 	}
-	if binary.LittleEndian.Uint32(img[8:12]) != ndjsonVersion {
-		return nil, ErrBadIndex
+	if err := checkVersion(FormatNDJSON, binary.LittleEndian.Uint32(img[8:12])); err != nil {
+		return nil, err
 	}
+	flags := binary.LittleEndian.Uint32(img[12:16])
 	n := binary.LittleEndian.Uint64(img[16:24])
 	dataLen := binary.LittleEndian.Uint64(img[24:32])
 	if n > uint64(len(img)) || dataLen > uint64(len(img)) {
@@ -228,10 +260,19 @@ func parseNDJSON(img []byte) (*NDJSONStore, error) {
 		}
 		pos += idxLen
 	}
+	recIdxEnd := pos
+	var fields []fieldIndex
+	if flags&ndjsonFlagFieldIndex != 0 {
+		var err error
+		fields, pos, err = parseFieldIndex(img, pos)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if pos != uint64(len(img)) {
 		return nil, ErrBadIndex // trailing garbage
 	}
-	return &NDJSONStore{image: img, data: data, offsets: offsets, idxOff: idxOff, n: int(n)}, nil
+	return &NDJSONStore{image: img, data: data, offsets: offsets, idxOff: idxOff, n: int(n), recIdxEnd: recIdxEnd, fields: fields}, nil
 }
 
 // Len returns the number of records.
@@ -250,7 +291,7 @@ func (s *NDJSONStore) Record(i int) (*Document, error) {
 	if i+1 < s.n {
 		end = s.idxOff[i+1]
 	} else {
-		end = uint64(len(s.image))
+		end = s.recIdxEnd
 	}
 	return ViewTrusted(s.image[start:end], rec)
 }
@@ -266,7 +307,7 @@ func (s *NDJSONStore) RecordInto(d *Document, i int) (*Document, error) {
 	if i+1 < s.n {
 		end = s.idxOff[i+1]
 	} else {
-		end = uint64(len(s.image))
+		end = s.recIdxEnd
 	}
 	return ViewInto(d, s.image[start:end], rec)
 }
@@ -355,11 +396,12 @@ func AppendNDJSON(w io.Writer, prior []byte, r io.Reader) (int, error) {
 	totalN := oldN + addN
 	totalDataLen := uint64(len(oldData)) + uint64(len(addData))
 
-	// Header.
+	// Header (preserve the field-index flag; the section is rebuilt below).
+	priorFlags := binary.LittleEndian.Uint32(prior[12:16])
 	var hdr [ndjsonHeader]byte
 	copy(hdr[0:8], ndjsonMagic)
 	binary.LittleEndian.PutUint32(hdr[8:12], ndjsonVersion)
-	binary.LittleEndian.PutUint32(hdr[12:16], 0)
+	binary.LittleEndian.PutUint32(hdr[12:16], priorFlags)
 	binary.LittleEndian.PutUint64(hdr[16:24], uint64(totalN))
 	binary.LittleEndian.PutUint64(hdr[24:32], totalDataLen)
 	if _, err := w.Write(hdr[:]); err != nil {
@@ -387,15 +429,15 @@ func AppendNDJSON(w io.Writer, prior []byte, r io.Reader) (int, error) {
 	if err := writeU64s(w, offsets); err != nil {
 		return 0, err
 	}
-	// Old indexes copied verbatim from the prior image (they run to its end,
-	// as parseNDJSON requires the index region to fill exactly).
+	// Old per-record indexes copied verbatim, up to the precise end of the
+	// record-index region (before any field-index section).
 	if oldN > 0 {
-		oldIdxStart := ps.idxOff[0]
-		if _, err := w.Write(prior[oldIdxStart:]); err != nil {
+		if _, err := w.Write(prior[ps.idxOff[0]:ps.recIdxEnd]); err != nil {
 			return 0, err
 		}
 	}
-	// New indexes built over the new record slices.
+	// New indexes built over the new record slices; kept for field-index rebuild.
+	newDocs := make([]*Document, addN)
 	for i := 0; i < addN; i++ {
 		rec := bytes.TrimRight(addData[newOffStart(newOff, i):newOff[i]], "\n")
 		d := IndexTape(rec)
@@ -403,6 +445,36 @@ func AppendNDJSON(w io.Writer, prior []byte, r io.Reader) (int, error) {
 			return 0, ErrBadIndex
 		}
 		if err := d.Persist(w); err != nil {
+			return 0, err
+		}
+		newDocs[i] = d
+	}
+	// Rebuild the field-index section over all records when the prior had one.
+	if priorFlags&ndjsonFlagFieldIndex != 0 {
+		fieldPaths := make([]string, len(ps.fields))
+		for i, f := range ps.fields {
+			fieldPaths[i] = f.path
+		}
+		allDocs := make([]*Document, totalN)
+		var oldDoc Document
+		for i := 0; i < oldN; i++ {
+			rec := bytes.TrimRight(oldData[ps.offsets[i]:ps.offsets[i+1]], "\n")
+			start := ps.idxOff[i]
+			var end uint64
+			if i+1 < oldN {
+				end = ps.idxOff[i+1]
+			} else {
+				end = ps.recIdxEnd
+			}
+			if _, err := ViewInto(&oldDoc, prior[start:end], rec); err != nil {
+				return 0, err
+			}
+			// Copy the document so each slice element is independent.
+			cp := oldDoc
+			allDocs[i] = &cp
+		}
+		copy(allDocs[oldN:], newDocs)
+		if err := writeFieldIndex(w, allDocs, fieldPaths); err != nil {
 			return 0, err
 		}
 	}

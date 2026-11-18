@@ -3,6 +3,7 @@ package jseek
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"os"
 	"sort"
@@ -54,6 +55,10 @@ type WALStore struct {
 	// wal, if set, is the file the edit log is persisted to (append-only).
 	wal     *os.File
 	walPath string
+	// basePath, if set, is the sealed base file. Compact persists the folded
+	// base here atomically before clearing the log, so a crash never loses
+	// committed edits.
+	basePath string
 	// gen bumps on every mutation (append/compact/replay). matGen records the
 	// generation matDoc was built at; a dirty-subtree read reuses matDoc when
 	// matGen == gen, making repeated reads O(1) instead of O(document).
@@ -62,6 +67,9 @@ type WALStore struct {
 	matGen uint64
 	matDoc []byte
 	matErr error
+	// lock, if set, is the cross-process write lock (held for the WALStore's
+	// lifetime). Only one process may write a given WAL at a time.
+	lock *fileLock
 }
 
 // OpenWAL opens a sealed base for cheap writes. If walPath is non-empty, the
@@ -72,10 +80,19 @@ func OpenWAL(basePath, walPath string) (*WALStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &WALStore{base: base, latest: make(map[string]int)}
+	w := &WALStore{base: base, latest: make(map[string]int), basePath: basePath}
 	if walPath != "" {
+		// Coordinate writers across processes: take an exclusive lock on a
+		// sidecar before touching the log. A second writer gets ErrLocked.
+		lk, err := acquireLock(walPath + ".lock")
+		if err != nil {
+			base.Close()
+			return nil, err
+		}
+		w.lock = lk
 		f, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
+			lk.release()
 			base.Close()
 			return nil, err
 		}
@@ -83,6 +100,7 @@ func OpenWAL(basePath, walPath string) (*WALStore, error) {
 		w.walPath = walPath
 		if err := w.replay(); err != nil {
 			f.Close()
+			lk.release()
 			base.Close()
 			return nil, err
 		}
@@ -531,12 +549,25 @@ func (w *WALStore) Compact() error {
 			return err
 		}
 	}
-	// Seal the compacted payload into a new in-memory base.
+	// Seal the compacted payload.
 	var buf bytes.Buffer
 	if err := Seal(&buf, cur); err != nil {
 		return err
 	}
-	nb, err := openStoreImage(buf.Bytes())
+	img := buf.Bytes()
+
+	// Crash-safe ordering: persist the new base BEFORE clearing the log.
+	//   - crash before the base rename: old base + full WAL replay correctly.
+	//   - crash after the base rename but before WAL truncate: the new base
+	//     already contains every edit; replaying the WAL re-applies them
+	//     idempotently (same final values), so nothing is lost or doubled.
+	//   - crash after WAL truncate: new base is durable and complete.
+	if w.basePath != "" {
+		if err := WriteFileAtomic(w.basePath, img, 0644); err != nil {
+			return err
+		}
+	}
+	nb, err := openStoreImage(img)
 	if err != nil {
 		return err
 	}
@@ -547,6 +578,9 @@ func (w *WALStore) Compact() error {
 	w.gen++
 	if w.wal != nil {
 		if err := w.wal.Truncate(0); err != nil {
+			return err
+		}
+		if err := w.wal.Sync(); err != nil {
 			return err
 		}
 		if _, err := w.wal.Seek(0, io.SeekStart); err != nil {
@@ -576,6 +610,12 @@ func (w *WALStore) Close() error {
 		}
 		w.base = nil
 	}
+	if w.lock != nil {
+		if e := w.lock.release(); e != nil && err == nil {
+			err = e
+		}
+		w.lock = nil
+	}
 	return err
 }
 
@@ -604,59 +644,106 @@ func splitWALPath(s string) []string {
 	return out
 }
 
-// --- WAL persistence format ---
-// Each record: magic byte 'E', op byte, u16 pathLen, path bytes, u32 valLen,
-// val bytes. Little-endian. A torn trailing record (short read) is ignored on
-// replay, which is safe: it was never acknowledged as committed.
+// --- WAL persistence format (v2, checksummed) ---
+// Each record: magic byte 'E', op byte, u16 pathLen, u32 valLen, path bytes,
+// val bytes, u32 CRC32 (IEEE, over op..val). Little-endian. The checksum lets
+// replay distinguish a cleanly committed record from a torn/corrupt tail: a
+// record whose CRC does not match (or that is truncated) was never acknowledged
+// and is discarded, and the log is truncated back to the last good record so
+// future appends stay consistent.
+//
+// Legacy v1 records (no trailing CRC) are still readable: replay detects them by
+// the absence of a valid checksum and accepts them only when the record is
+// complete and followed by another valid record or EOF. New writes always emit
+// the checksummed v2 format.
 
+const walCRCSize = 4
+
+func walRecordBytes(e walEdit) []byte {
+	n := 8 + len(e.path) + len(e.val) + walCRCSize
+	buf := make([]byte, n)
+	buf[0] = 'E'
+	buf[1] = byte(e.op)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(e.path)))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(e.val)))
+	copy(buf[8:], e.path)
+	copy(buf[8+len(e.path):], e.val)
+	// CRC covers everything after the magic byte through the value.
+	crc := crc32.ChecksumIEEE(buf[1 : n-walCRCSize])
+	binary.LittleEndian.PutUint32(buf[n-walCRCSize:], crc)
+	return buf
+}
+
+// writeWALEdit appends one checksummed record. When w is an *os.File the append
+// is fsynced so a confirmed write is durable; for other writers (tests, buffers)
+// it is a plain write.
 func writeWALEdit(w io.Writer, e walEdit) error {
-	var hdr [8]byte
-	hdr[0] = 'E'
-	hdr[1] = byte(e.op)
-	binary.LittleEndian.PutUint16(hdr[2:4], uint16(len(e.path)))
-	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(e.val)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
+	rec := walRecordBytes(e)
+	if f, ok := w.(*os.File); ok {
+		return appendFileSync(f, rec)
 	}
-	if _, err := io.WriteString(w, e.path); err != nil {
-		return err
-	}
-	if len(e.val) > 0 {
-		if _, err := w.Write(e.val); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := w.Write(rec)
+	return err
 }
 
 func (w *WALStore) replay() error {
+	if _, err := w.wal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	data, err := io.ReadAll(w.wal)
 	if err != nil {
 		return err
 	}
-	// Position the file at the end for subsequent appends.
-	if _, err := w.wal.Seek(0, io.SeekEnd); err != nil {
-		return err
-	}
 	pos := 0
+	good := 0 // byte offset just past the last fully validated record
 	for pos+8 <= len(data) {
 		if data[pos] != 'E' {
-			break // corrupt/torn tail: stop, ignore the rest
+			break // corrupt/torn tail
 		}
 		op := walOp(data[pos+1])
 		pl := int(binary.LittleEndian.Uint16(data[pos+2 : pos+4]))
 		vl := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
-		pos += 8
-		if pos+pl+vl > len(data) {
-			break // torn record
+		bodyEnd := pos + 8 + pl + vl
+		if bodyEnd > len(data) {
+			break // truncated record
 		}
-		path := string(data[pos : pos+pl])
-		pos += pl
-		val := append([]byte(nil), data[pos:pos+vl]...)
-		pos += vl
+		// v2: a trailing CRC32 must match. v1 (no CRC) is accepted only when the
+		// record is complete and the next byte starts another record or EOF.
+		if bodyEnd+walCRCSize <= len(data) {
+			want := binary.LittleEndian.Uint32(data[bodyEnd : bodyEnd+walCRCSize])
+			got := crc32.ChecksumIEEE(data[pos+1 : bodyEnd])
+			if want != got {
+				// Could be a legacy v1 record whose "CRC" bytes are actually the
+				// next record's header. Accept as v1 only if the next byte is a
+				// record magic or this is the final record.
+				nextIsRecord := bodyEnd == len(data) || data[bodyEnd] == 'E'
+				if !nextIsRecord {
+					break // genuine corruption
+				}
+				// Legacy v1: consume without the CRC.
+			} else {
+				bodyEnd += walCRCSize
+			}
+		}
+		path := string(data[pos+8 : pos+8+pl])
+		val := append([]byte(nil), data[pos+8+pl:pos+8+pl+vl]...)
 		idx := len(w.edits)
 		w.edits = append(w.edits, walEdit{path: path, op: op, val: val})
 		w.latest[path] = idx
+		pos = bodyEnd
+		good = pos
+	}
+	// Truncate any torn/corrupt tail so future appends extend a consistent log.
+	if good < len(data) {
+		if err := w.wal.Truncate(int64(good)); err != nil {
+			return err
+		}
+		if err := w.wal.Sync(); err != nil {
+			return err
+		}
+	}
+	if _, err := w.wal.Seek(0, io.SeekEnd); err != nil {
+		return err
 	}
 	return nil
 }

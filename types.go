@@ -60,4 +60,9 @@ var (
 	// ErrOverflow is returned when a number cannot be represented in the
 	// requested Go type.
 	ErrOverflow = errors.New("jseek: number overflows target type")
+	// ErrLocked is returned when another process holds the store's write lock.
+	ErrLocked = errors.New("jseek: store is locked by another writer")
+	// ErrUnsupportedVersion is returned when a sealed format's version is newer
+	// than this build understands (no migration path).
+	ErrUnsupportedVersion = errors.New("jseek: unsupported format version")
 )

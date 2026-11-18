@@ -671,6 +671,98 @@ scalar-root edge). Full matrix + race green.
 whole document — logically unavoidable (the result IS the whole document).
 Every *partial* read and every write is now document-size-independent.
 
+## Round 9 — NDJSON query engine: log analytics on the zero-parse substrate
+
+The random-access store (round 7) made record N reachable in O(1); round 9 makes
+the whole store *queryable* without re-parsing a single record. WHERE filtering,
+projection, and aggregation all run on the per-record sealed indexes.
+
+100 000 records, Apple M4 Pro, same-binary, `-benchtime=300ms -count=2`:
+
+| Operation | time | allocs |
+|---|---|---|
+| Count (no filter) | ~1.0 ms | 0 |
+| Count WHERE `status == "error"` | ~5.0 ms | 0 |
+| Aggregate (sum/avg/min/max) WHERE | ~6.3 ms | 2 |
+| GroupAggregate by status | ~9.8 ms | 11 |
+
+The first WHERE prototype allocated twice per record (200 000 allocs / 100 k
+records) because the literal was re-decoded and the path re-split every record.
+Precomputing the literal type/decoded value at parse time and reusing a decode
+buffer brought filtering to **zero allocation** and ~2× faster. Group-by went
+from 200 000 allocs to **11** (bounded by the number of groups, not records) via
+a key-intern cache. CLI end-to-end: a full filtered aggregation over 100 k log
+records runs in ~10 ms wall time including process start and mmap.
+
+Correctness: `FuzzNDJSONQueryDifferential` checks Count against an independent
+`encoding/json` reference; `FuzzParseWhereNoPanic` guards the parser. Full matrix
++ race + safe + purego green.
+
+**Honest boundary:** this is a single-pass scan engine, not an indexed query
+planner — a WHERE still visits every record (it just touches only the tested
+fields, zero-parse). A field index that skips non-matching records outright is
+future work; the win here is that the scan itself is allocation-free and never
+re-parses JSON.
+
+## Round 9b — durability hardening (correctness, not speed)
+
+The substrate previously had **zero fsync**: a confirmed WAL write could be lost
+on power failure, records had no checksum, and `Compact` truncated the log while
+the folded base lived only in memory — a crash there lost every committed edit.
+Round 9b closes these:
+
+- WAL v2 records carry CRC32; appends fsync before returning.
+- Replay validates each record and truncates torn/corrupt tails to the last good
+  record, so the log stays consistent for future appends.
+- `Compact` writes the new base atomically (temp+fsync+rename+dir-fsync) *before*
+  clearing the log; replay over an already-compacted base is idempotent.
+- `WriteFileAtomic`/`SealFileAtomic` give every file replacement no-torn semantics.
+
+Proven by crash-injection tests: truncated trailing record, flipped value byte
+(CRC rejects), and the compact-before-truncate window (idempotent recovery).
+These are durability guarantees, not benchmark wins — recorded because a store
+that loses data is not a store, however fast it reads.
+
+## Round 10 — field index: from fast scan to actual index
+
+Round 9's query engine was a *fast scan*: allocation-free and zero-parse, but a
+WHERE still visited every record. Round 10 adds a real index so a selective query
+touches only the matching records.
+
+`SealNDJSONIndexed` keeps, per indexed field, a sorted table of (value, recordID).
+A comparison binary-searches the value band to a contiguous record-ID set;
+multiple predicates intersect their sets (smallest first); only survivors are
+evaluated against the full predicate.
+
+100 000 records, 1% selectivity (`status == "error"` matches 1 000), Apple M4 Pro,
+`-benchtime=500ms -count=3`:
+
+| Path | time | allocs |
+|---|---|---|
+| Full scan (no index) | ~4.1 ms | 1 |
+| Field index (selective) | ~60 µs | 7 |
+
+**~68×** on the selective query. The index costs ~8 KB of candidate-set allocation
+per query (the record-ID slices); the scan stays zero-alloc. Non-selective queries
+fall back to the scan, so the index never makes a query slower by more than the
+lookup overhead.
+
+Two bugs the differential tests caught and fixed:
+- the last record's index slice ran to `len(image)`, which now includes the
+  trailing field-index section — fixed with an explicit record-index-region end;
+- candidate sets came back value-sorted but the intersection assumed record-ID
+  order — fixed by sorting candidates by record ID.
+
+Correctness: `TestFieldIndexMatchesScan` checks indexed == scan across every
+operator/type and multi-predicate conjunctions; `FuzzFieldIndexMatchesScan`
+differential-fuzzes it (6.7M+ execs, zero divergence). `AppendNDJSON` preserves
+and rebuilds the index. Full matrix + race + safe + purego + cross green.
+
+**Honest boundary:** the index is per-field equality/range, built at seal time;
+it is not a general query planner (no join, no composite-key optimization, no
+automatic index selection). Appending rebuilds the whole field-index section
+(O(records)); a truly incremental index merge is future work.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

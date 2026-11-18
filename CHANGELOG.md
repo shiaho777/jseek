@@ -7,6 +7,68 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Cross-process write coordination + live readers** (`lock_unix.go`,
+  `wal_reader.go`): `OpenWAL` takes an exclusive advisory `flock` on a sidecar
+  (`<wal>.lock`), so a second writer process gets `ErrLocked` instead of
+  interleaving corruption; the lock auto-releases if a writer crashes.
+  `WALReader` is a read-only cross-process view: `Refresh()` re-maps the base
+  only when the writer atomically replaced it (file-identity check) and
+  incrementally replays newly appended checksummed WAL records (tracks a byte
+  offset, never re-reads the whole log), so readers see committed edits live and
+  stay consistent across compaction. Proven by a true two-process lock test and
+  incremental-refresh / across-compact / torn-tail tests. Non-unix platforms
+  fail fast on a second writer (no advisory flock); persistent-WAL tests are
+  unix-gated.
+- **Format version migration framework** (`migrate.go`): `checkVersion` rejects
+  newer-than-supported formats with `ErrUnsupportedVersion` (wired into the
+  store and NDJSON parsers); `RegisterMigration`/`Migrate` chain per-version
+  upgrade hooks so a future v2 format ships with an explicit, tested upgrade
+  path. All formats are v1 today with no migrations registered.
+- **Field index — queries skip non-matching records** (`ndjson_fieldindex.go`):
+  `SealNDJSONIndexed(w, r, fields)` builds an optional trailing sorted-value
+  index per field; a WHERE comparison resolves to a record-ID set by binary
+  search, multiple predicates intersect their sets, and only survivors are
+  evaluated. On a 1%-selective query over 100k records: **~60 µs vs ~4.1 ms full
+  scan (~68×)**; non-selective queries fall back to the scan, never worse.
+  Stores without the index parse and query exactly as before (header flag bit0);
+  `AppendNDJSON` preserves and rebuilds the index. CLI: `jseek -seal-n in.ndjson
+  out.njstore -index status,region`. Differential-fuzzed indexed-vs-scan
+  (`FuzzFieldIndexMatchesScan`, 6.7M+ execs, zero divergence).
+- **NDJSON query engine** (`ndjson_query.go`): record-level WHERE filtering,
+  projection, and aggregation (count/sum/avg/min/max + group-by) over the
+  zero-parse random-access store — `SELECT fields FROM records WHERE cond
+  GROUP BY key`. `ParseWhere` parses a predictable comparison conjunction
+  (`latency_ms > 100 && status == "error"`); predicates precompute the literal
+  type/decoded value and reuse decode buffers, so filtering and aggregation are
+  **zero-allocation per record**. On 100k records (Apple M4 Pro): CountWhere
+  ~5 ms / 0 allocs, Aggregate ~6.3 ms, GroupAggregate ~9.8 ms / 11 allocs
+  (group-count-bound, not record-bound). CLI: `jseek -q store.njstore
+  [-where cond] [-select f1,f2] [-agg field] [-group key] [-limit N]`.
+  Differential-fuzzed against an `encoding/json` reference.
+- **Crash-safe durability** (`durable.go`, WAL v2): `WriteFileAtomic` /
+  `SealFileAtomic` (temp + fsync + rename + dir-fsync) guarantee no torn file;
+  WAL records now carry a CRC32 checksum and appends are fsynced, so a confirmed
+  write survives power loss; replay detects and truncates torn/corrupt tails;
+  `Compact` persists the folded base atomically **before** clearing the log,
+  closing the crash window that previously lost committed edits (replay over a
+  compacted base is idempotent). Proven by crash-injection tests (torn tail,
+  flipped-byte CRC, compact-before-truncate).
+- **gjson drop-in compatibility layer** (`gjsoncompat`): one-line import swap
+  (`import gjson "github.com/shiaho777/jseek/gjsoncompat"`) preserves the common
+  gjson read API — `Get`/`GetBytes`/`Parse`/`GetMany`/`GetManyBytes`/`Valid` and
+  the `Result` accessors — backed by jseek's lazy engine. `Result.Type` numbering
+  matches gjson exactly; terminal `#` counts, numeric object keys, and lenient
+  number overflow (`1e1000`→`+Inf`) are bridged. Differential-tested against real
+  gjson (`FuzzGjsonCompatSinglePath`, 8.5M+ execs, zero divergence). Modifiers
+  and gjson-specific filter syntax are out of scope and return not-found rather
+  than panicking. See `docs/MIGRATION.md`.
+- **Zero-install browser playground** (`playground/`): the same engine compiled
+  to WebAssembly (`query`/`valid`/`count`/`bench`), runs entirely locally — no
+  data leaves the page. Rebuild with `scripts/build-playground.sh`.
+- **Reproducible benchmark script** (`scripts/reproducible-bench.sh`): one command
+  reproduces every headline number — library A/B vs gjson/jsonparser/sonic/
+  simdjson-go, index/tape/transpose, zero-parse open, WAL cheap writes, NDJSON
+  random access, and CLI vs jq on real generated files.
 - **Persistent structural index — zero-parse data substrate**: `Document.Persist`,
   `Open`, `View`, `ViewTrusted`, `VerifyIndex`, `IndexSize`. The pointer-free
   index is sealed to disk once and re-opened by any process with no re-scan;

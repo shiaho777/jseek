@@ -24,6 +24,17 @@ n, _    := jseek.GetInt(data, "user", "followers")      // 42
 tag, _  := jseek.GetString(data, "tags", "[1]")         // "b"
 ```
 
+**Coming from gjson?** Switch engines with a one-line import change —
+`import gjson "github.com/shiaho777/jseek/gjsoncompat"` — and keep your existing
+`gjson.Get(...)` call sites. See [docs/MIGRATION.md](docs/MIGRATION.md) for the
+preserved API surface and the differential fuzzing against real gjson.
+
+**Try it without installing anything:** the [browser playground](playground/)
+runs the same engine via WebAssembly, entirely locally — no data leaves the
+page. Build it with `./scripts/build-playground.sh`, then serve `playground/`
+over http. Reproduce every headline number with
+[`./scripts/reproducible-bench.sh`](scripts/reproducible-bench.sh).
+
 ## The `jseek` CLI — jq's job, at lazy-extraction speed
 
 jseek ships a **single static binary with zero runtime dependencies** that
@@ -190,6 +201,70 @@ indexes only the new ones (O(new records)). Guarded by
 The zero-copy view reinterprets the index arrays in place (default build);
 `-tags jseeksafe` decodes them safely instead. mmap is used on unix; other
 platforms fall back to a one-time read. The format is experimental (pre-1.0).
+
+### Query engine: SQL-like analytics over JSON logs
+
+The store is not just random-access — it is queryable. Filter, project, and
+aggregate records without re-parsing any of them:
+
+```go
+s, _ := jseek.OpenNDJSONStore("logs.njstore")
+w, _ := jseek.ParseWhere(`latency_ms > 100 && status == "error"`)
+n, _ := s.Count(w)                          // matching records
+a, _ := s.Aggregate(w, "latency_ms")        // count/sum/avg/min/max
+g, _ := s.GroupAggregate(nil, "region", "latency_ms") // per-region stats
+out, _ := s.SelectJSON(w, []string{"id", "latency_ms"}, 10) // projected NDJSON
+```
+
+```sh
+jseek -seal-n logs.ndjson logs.njstore -index status,region   # build a field index
+jseek -q logs.njstore -where 'latency_ms > 100 && status == "error"' \
+      -select id,latency_ms -limit 10
+jseek -q logs.njstore -where 'status == "error"' -agg latency_ms
+jseek -q logs.njstore -agg latency_ms -group region
+```
+
+With `-index`, a selective WHERE binary-searches the field index and evaluates
+only matching records: on a 1%-selective query over 100k records, **~60 µs vs
+~4.1 ms full scan (~68×)**. Without an index (or for non-selective queries) it
+falls back to the zero-parse scan — never slower. Indexed results are
+differential-fuzzed to equal the scan exactly.
+
+**Measured** (100 000 records, Apple M4 Pro): filtered count ~5 ms / **0 allocs**,
+aggregation ~6.3 ms, group-by ~9.8 ms / 11 allocs (group-count-bound). A full
+filtered aggregation over 100 k log records runs in ~10 ms wall time end-to-end.
+Predicates precompute the literal and reuse decode buffers, so the scan never
+allocates per record. Differential-fuzzed against `encoding/json`. This is a
+single-pass zero-parse scan, not an indexed planner — a field index that skips
+non-matching records is future work.
+
+### Crash-safe writes
+
+The WAL is durable: records carry a CRC32 checksum, appends fsync before
+returning, replay truncates torn/corrupt tails, and `Compact` persists the folded
+base atomically *before* clearing the log — so a crash never loses a confirmed
+write. `WriteFileAtomic`/`SealFileAtomic` give every file replacement no-torn
+semantics. Proven by crash-injection tests (torn tail, flipped-byte CRC,
+compact-before-truncate idempotent recovery).
+
+### Multi-process: one writer, many live readers
+
+`OpenWAL` takes an exclusive advisory lock, so only one process writes a given
+store; a second writer gets `ErrLocked` (and a crashed writer's lock auto-releases).
+Reader processes use `WALReader` to see commits live without the write lock:
+
+```go
+r, _ := jseek.OpenWALReader("data.jstore", "data.wal")
+defer r.Close()
+r.Refresh()                       // pick up the writer's latest commits
+v, _ := r.GetInt("config", "rps") // base + overlay, zero-parse
+```
+
+`Refresh` re-maps the base only when the writer atomically replaced it, and
+replays just the newly appended WAL records — cheap when nothing changed,
+consistent across compaction. A format-version migration framework
+(`RegisterMigration`/`Migrate`, `ErrUnsupportedVersion`) gives future format
+changes an explicit upgrade path.
 
 ## State of the art for lazy JSON extraction
 

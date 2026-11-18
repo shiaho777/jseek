@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -121,6 +122,9 @@ func TestWALCompact(t *testing.T) {
 }
 
 func TestWALPersistenceReplay(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "js" {
+		t.Skip("persistent WAL requires unix advisory locks")
+	}
 	dir := t.TempDir()
 	basePath := filepath.Join(dir, "b.jstore")
 	f, _ := os.Create(basePath)
