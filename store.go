@@ -76,7 +76,7 @@ func parseSealed(b []byte) (sealedLayout, bool) {
 	if string(b[0:8]) != storeMagic {
 		return sealedLayout{}, false
 	}
-	if binary.LittleEndian.Uint32(b[8:12]) != storeVersion {
+	if err := checkVersion(FormatStore, binary.LittleEndian.Uint32(b[8:12])); err != nil {
 		return sealedLayout{}, false
 	}
 	dataLen := binary.LittleEndian.Uint64(b[16:24])
@@ -140,9 +140,12 @@ func VerifySealed(b []byte) error {
 // A Store is safe for concurrent use: each View returns an independent
 // Document aliasing the same immutable mapping.
 type Store struct {
-	image []byte
-	f     *os.File
+	image  []byte
+	f      *os.File
 	layout sealedLayout
+	// path, if set, is the file backing the store (for readers to re-map after
+	// a writer atomically replaces it). Empty for in-memory images.
+	path string
 }
 
 // OpenStore memory-maps path (a sealed .jstore file) and verifies it. The
@@ -173,7 +176,7 @@ func OpenStore(path string) (*Store, error) {
 		f.Close()
 		return nil, err
 	}
-	return &Store{image: img, f: f, layout: l}, nil
+	return &Store{image: img, f: f, layout: l, path: path}, nil
 }
 
 // View returns an O(1) Document over the store's payload (no re-scan, no

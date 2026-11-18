@@ -247,6 +247,25 @@ write. `WriteFileAtomic`/`SealFileAtomic` give every file replacement no-torn
 semantics. Proven by crash-injection tests (torn tail, flipped-byte CRC,
 compact-before-truncate idempotent recovery).
 
+### Multi-process: one writer, many live readers
+
+`OpenWAL` takes an exclusive advisory lock, so only one process writes a given
+store; a second writer gets `ErrLocked` (and a crashed writer's lock auto-releases).
+Reader processes use `WALReader` to see commits live without the write lock:
+
+```go
+r, _ := jseek.OpenWALReader("data.jstore", "data.wal")
+defer r.Close()
+r.Refresh()                       // pick up the writer's latest commits
+v, _ := r.GetInt("config", "rps") // base + overlay, zero-parse
+```
+
+`Refresh` re-maps the base only when the writer atomically replaced it, and
+replays just the newly appended WAL records — cheap when nothing changed,
+consistent across compaction. A format-version migration framework
+(`RegisterMigration`/`Migrate`, `ErrUnsupportedVersion`) gives future format
+changes an explicit upgrade path.
+
 ## State of the art for lazy JSON extraction
 
 JSON libraries fall into two camps:

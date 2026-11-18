@@ -67,6 +67,9 @@ type WALStore struct {
 	matGen uint64
 	matDoc []byte
 	matErr error
+	// lock, if set, is the cross-process write lock (held for the WALStore's
+	// lifetime). Only one process may write a given WAL at a time.
+	lock *fileLock
 }
 
 // OpenWAL opens a sealed base for cheap writes. If walPath is non-empty, the
@@ -79,8 +82,17 @@ func OpenWAL(basePath, walPath string) (*WALStore, error) {
 	}
 	w := &WALStore{base: base, latest: make(map[string]int), basePath: basePath}
 	if walPath != "" {
+		// Coordinate writers across processes: take an exclusive lock on a
+		// sidecar before touching the log. A second writer gets ErrLocked.
+		lk, err := acquireLock(walPath + ".lock")
+		if err != nil {
+			base.Close()
+			return nil, err
+		}
+		w.lock = lk
 		f, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
+			lk.release()
 			base.Close()
 			return nil, err
 		}
@@ -88,6 +100,7 @@ func OpenWAL(basePath, walPath string) (*WALStore, error) {
 		w.walPath = walPath
 		if err := w.replay(); err != nil {
 			f.Close()
+			lk.release()
 			base.Close()
 			return nil, err
 		}
@@ -596,6 +609,12 @@ func (w *WALStore) Close() error {
 			err = e
 		}
 		w.base = nil
+	}
+	if w.lock != nil {
+		if e := w.lock.release(); e != nil && err == nil {
+			err = e
+		}
+		w.lock = nil
 	}
 	return err
 }

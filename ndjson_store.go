@@ -205,8 +205,8 @@ func parseNDJSON(img []byte) (*NDJSONStore, error) {
 	if len(img) < ndjsonHeader || string(img[0:8]) != ndjsonMagic {
 		return nil, ErrBadIndex
 	}
-	if binary.LittleEndian.Uint32(img[8:12]) != ndjsonVersion {
-		return nil, ErrBadIndex
+	if err := checkVersion(FormatNDJSON, binary.LittleEndian.Uint32(img[8:12])); err != nil {
+		return nil, err
 	}
 	flags := binary.LittleEndian.Uint32(img[12:16])
 	n := binary.LittleEndian.Uint64(img[16:24])

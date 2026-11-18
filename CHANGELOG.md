@@ -7,6 +7,23 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Cross-process write coordination + live readers** (`lock_unix.go`,
+  `wal_reader.go`): `OpenWAL` takes an exclusive advisory `flock` on a sidecar
+  (`<wal>.lock`), so a second writer process gets `ErrLocked` instead of
+  interleaving corruption; the lock auto-releases if a writer crashes.
+  `WALReader` is a read-only cross-process view: `Refresh()` re-maps the base
+  only when the writer atomically replaced it (file-identity check) and
+  incrementally replays newly appended checksummed WAL records (tracks a byte
+  offset, never re-reads the whole log), so readers see committed edits live and
+  stay consistent across compaction. Proven by a true two-process lock test and
+  incremental-refresh / across-compact / torn-tail tests. Non-unix platforms
+  fail fast on a second writer (no advisory flock); persistent-WAL tests are
+  unix-gated.
+- **Format version migration framework** (`migrate.go`): `checkVersion` rejects
+  newer-than-supported formats with `ErrUnsupportedVersion` (wired into the
+  store and NDJSON parsers); `RegisterMigration`/`Migrate` chain per-version
+  upgrade hooks so a future v2 format ships with an explicit, tested upgrade
+  path. All formats are v1 today with no migrations registered.
 - **Field index — queries skip non-matching records** (`ndjson_fieldindex.go`):
   `SealNDJSONIndexed(w, r, fields)` builds an optional trailing sorted-value
   index per field; a WHERE comparison resolves to a record-ID set by binary
