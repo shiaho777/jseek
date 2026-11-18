@@ -107,3 +107,39 @@ func TestCLIFileAndStdin(t *testing.T) {
 		t.Errorf("stdin: %q code %d", got, code)
 	}
 }
+
+func TestCLIWAL(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "s.json")
+	os.WriteFile(src, []byte(`{"cfg":{"v":1},"n":5}`), 0644)
+	base := filepath.Join(dir, "s.jstore")
+	wal := filepath.Join(dir, "e.wal")
+	if _, code := run(t, bin, "", "-seal", src, base); code != 0 {
+		t.Fatalf("seal code %d", code)
+	}
+	// Cheap write.
+	if _, code := run(t, bin, "", "-wal", wal, "-wset", base, "cfg.v", "42"); code != 0 {
+		t.Fatalf("wset code %d", code)
+	}
+	// Overlay read.
+	got, code := run(t, bin, "", "-wal", wal, "-wget", base, "cfg.v")
+	if code != 0 || got != "42\n" {
+		t.Errorf("wget: %q code %d", got, code)
+	}
+	// Delete + read missing.
+	run(t, bin, "", "-wal", wal, "-wdel", base, "n")
+	_, code = run(t, bin, "", "-wal", wal, "-wget", base, "n")
+	if code == 0 {
+		t.Error("deleted key still readable")
+	}
+	// Compact into a new base, then plain open reflects edits.
+	comp := filepath.Join(dir, "c.jstore")
+	if _, code := run(t, bin, "", "-wal", wal, "-wcompact", base, comp); code != 0 {
+		t.Fatalf("wcompact code %d", code)
+	}
+	got, code = run(t, bin, "", "-open", comp, "cfg.v")
+	if code != 0 || got != "42\n" {
+		t.Errorf("compacted read: %q code %d", got, code)
+	}
+}

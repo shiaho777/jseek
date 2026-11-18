@@ -408,6 +408,269 @@ stays 1. Large single-doc queries remain ~7–23× faster than jq (`..city`:
 1.23.4 — cannot verify, so not shipped blind); Pison-style parallel structural
 indexing and arm64 SVE kernels need hardware/CI this machine lacks.
 
+## 2026-11 round 5: persistent index — the zero-parse data substrate
+
+The strategic breakthrough: jseek's Stage-1 index is a pointer-free []uint32,
+so it can be persisted and re-opened with ZERO re-scanning. This moves jseek
+from "fast per-process extractor" toward "embeddable, shareable JSON storage"
+(the SQLite-of-JSON direction). New APIs: Document.Persist, Open, View,
+ViewTrusted, VerifyIndex, IndexSize.
+
+Measured (Apple M4 Pro, 27 KB doc, open + deep GetInt), same-binary A/B:
+
+| Path | time | allocs |
+| --- | --- | --- |
+| RebuildIndexTape (re-scan every open) | ~19.5 µs | 109 KB / 7 |
+| Open (streaming decode + hash + offset verify) | ~20 µs | 74 KB / 7 |
+| View (zero-copy + full hash & offset verify) | ~7.9 µs | 128 B / 1 |
+| **ViewTrusted after one VerifyIndex** | **~126 ns** | **128 B / 1** |
+
+The canonical mmap pattern (map once → VerifyIndex once → ViewTrusted many)
+is **~155× faster and ~850× less allocating** than rebuilding. Cross-process
+demo: writer seals store.json + store.jix; reader maps and sustains 100 000
+opens + 2-field queries at ~229 ns each.
+
+**Honest boundaries:**
+- Index overhead is ~217% of payload WITH tape (structural ~108% + tape ~108%);
+  plain Index (no tape) is ~108%. The substrate trades disk for zero-parse opens.
+- ViewTrusted skips the per-open hash by design — it requires a one-time
+  VerifyIndex on an immutable mapping. View (default) still hashes per open.
+- The win is on REPEATED opens of STABLE data. For one-shot reads of changing
+  data, stateless Get / Index remains the right tool.
+- -tags jseeksafe decodes the arrays (3 allocs) instead of zero-copy
+  reinterpreting; the guarantee there is safety, not zero allocation.
+
+## 2026-11 round 6: substrate hardening + self-contained stores + CLI
+
+- **Fast payload hash**: replaced byte-wise FNV-1a (~0.3 GB/s) with a
+  word-at-a-time multiply-xor-rotate mix measured at **~6.7 GB/s** (~20×).
+  This made the fully-verified `View` (~7.9 µs) **~2.5× faster than rebuilding**
+  (~19.5 µs) — integrity no longer costs more than a re-scan. Format flags bit1
+  records the hash algorithm; the format is experimental (pre-1.0).
+- **Offset bounds validation**: every structural/tape offset is checked against
+  the payload length on View/Open/VerifyIndex, so a corrupt-but-hash-matching
+  image can never drive navigation out of bounds. Runs with the hash check;
+  the trusted O(1) path skips it (already verified). ViewTrusted stays ~126 ns.
+- **Self-contained stores** (`store.go`): `Seal`/`OpenSealed`/`ViewSealed`/
+  `ViewSealedTrusted`/`VerifySealed` pack payload+index into one "JSEEKST1"
+  file (payload padded to 4-byte alignment for zero-copy index reinterpret).
+- **mmap store handle**: `OpenStore`/`Store.View`/`Store.Close` maps a sealed
+  file read-only once, verifies once, hands out concurrent-safe O(1) Documents.
+  unix uses syscall.Mmap; other platforms fall back to a one-time read.
+- **CLI**: `jseek -seal in.json out.jstore` and `jseek -open out.jstore 'path'`
+  expose the substrate from the terminal.
+- **FuzzPersistRoundTrip**: persist→View/Open round-trip agreement + corrupt
+  rejection on arbitrary bytes (5.7M execs clean). Full matrix + windows/linux
+  cross-compilation green.
+
+**Honest note:** CLI single-shot `-open` vs reading the raw .json is dominated
+by process startup + file read (0.17s vs 0.19s over 20 runs on 7.4 MB) — the
+substrate's real win is repeated in-process opens (the library numbers above),
+not one-shot CLI invocations.
+
+## 2026-11 round 7: NDJSON random-access store + zero-alloc reuse
+
+- **NDJSON random-access store** (`ndjson_store.go`): `SealNDJSON` builds a
+  per-record uint64 offset table + a sealed index per record; `OpenNDJSONStore`
+  maps and validates once; `Record(i)` / `RecordInto` jump in O(1). `Each`
+  scans with a reused Document (zero alloc). `AppendNDJSON` copies prior
+  records verbatim and indexes only new ones (incremental write path).
+  CLI: `-seal-n` / `-open-n ... -at N` / `-append-n`.
+
+  Measured (5000 records, jump to record 4999 + GetInt), same-binary A/B:
+
+  | Path | time | allocs |
+  | --- | --- | --- |
+  | Store.RecordInto(4999) | **~45 ns** | **0** |
+  | Sequential scan to 4999 (plain NDJSON reader) | ~69 µs | 128 B / 2 |
+
+  **~1500×** for random access vs sequential — the qualitative change from
+  "logs can only be scanned" to "any record instantly". CLI `-at` over 50
+  process invocations: 0.15 s total.
+
+- **ViewInto / RecordInto**: zero-allocation trusted views that re-point an
+  existing Document. Hot loops allocate **0** (verified by AllocsPerRun;
+  skipped under jseeksafe where arrays are decoded).
+
+- **Bug found & fixed by FuzzNDJSONStoreRoundTrip**: parseNDJSON did not set
+  the image field, so Record's last-record index bound sliced out of range
+  when called directly. Fixed; 4.2M fuzz execs clean.
+
+**Honest boundaries:** the NDJSON store trades ~per-record index overhead for
+O(1) access; it suits read-heavy stable logs, not high-frequency single-record
+mutation (append rebuilds the tail table). Random-access win grows with record
+count; for tiny files a sequential scan is fine.
+
+## 2026-11 round 8: incremental index patch — the single-document write path
+
+`PatchSet` / `PatchDelete` update a Document's index without a full re-scan:
+structurals before the edit keep their offsets, structurals after shift by the
+length delta, and only the edited region is re-scanned. `Store.Set` /
+`Store.Delete` expose field-level writes on a sealed store (returning a new
+image). Correctness gated by `FuzzPatchMatchesRebuild` (5.5M execs, patched
+index == full rebuild on every probe).
+
+**Honest measurement — this is a modest win, not a breakthrough:**
+
+| Scenario (2000–5000 records) | FullRebuild | IncrementalPatch |
+| --- | --- | --- |
+| front edit, mixed doc | ~62 µs / 344 KB | ~53 µs / 189 KB (~17% faster, ~45% less mem) |
+| front edit, string-heavy | ~153 µs | ~153 µs (parity) |
+| tail edit, string-heavy | ~181 µs | ~176 µs (~3%) |
+
+**Why the gain is limited:** a Set/Delete shifts every byte after the edit, so
+the payload MUST be copied in full (contiguous JSON has no gap to exploit). The
+memcpy dominates; the index re-scan it avoids was already the cheaper part. The
+patch's real value is (a) it makes field-level writes on the substrate possible
+at all without re-parsing string bodies, (b) ~45% less index allocation on
+front edits, and (c) it is the foundation for a future persistent write path.
+It is NOT a dramatic speedup, and we record it as such. A truly cheap write
+would need a non-contiguous / paged payload format — a larger redesign, deferred.
+
+## 2026-11 round 9: WAL overlay — genuinely cheap writes (the breakthrough)
+
+Round 8 proved an in-place edit must copy the whole contiguous payload. Round 9
+sidesteps that entirely with a **log-structured overlay** (the SQLite-WAL / LSM
+idea): `WALStore` keeps the immutable sealed base plus an append-only edit log.
+A write appends ONE small record (path + op + value) — **no payload copy, no
+index rebuild**. Reads resolve the base zero-parse, then apply the latest
+matching overlay edit; subtree reads affected by the overlay materialize on
+demand. `Compact` folds the log into a fresh base, amortizing the one expensive
+copy over many cheap writes. Optional WAL file persists edits for crash-safe
+replay. CLI: `-wal` + `-wset`/`-wdel`/`-wget`/`-wcompact`.
+
+**Measured write cost (5000-record ~330 KB doc), same-binary A/B:**
+
+| Write method | time | allocs |
+| --- | --- | --- |
+| Full Set rewrite (copy whole payload) | ~82 µs | 344 KB |
+| **WAL append (with applicability check)** | **~180 ns** | **~300 B** |
+
+**~450× faster, ~1100× less memory.** And the defining property — **write cost
+is independent of document size:**
+
+| doc size | WAL write |
+| --- | --- |
+| 100 records | ~163 ns |
+| 5 000 records | ~163 ns |
+| 50 000 records | ~186 ns |
+
+The write touches only the edit, never the payload. This is genuinely cheap
+writes — the thing round 8 said needed a redesign, achieved instead by changing
+the *write model* (append-only overlay) rather than the payload format.
+
+**Honest boundaries (as of round 9; the first one is broken in round 10):**
+- ~~Reads of an overlay-dirtied subtree materialize (O(document)) every time.~~
+  → Round 10 caches the materialization against the edit generation: repeated
+  dirty-subtree reads are O(1); only the first read after an edit rebuilds.
+- The overlay is path-keyed; an edit's applicability is validated with a cheap
+  O(path-depth) walk at write time (this is the ~180 ns, vs ~80 ns pure append).
+- Compaction is the one O(document) operation; amortize it over many writes.
+- Concurrent-safe (RWMutex); base mapping immutable. FuzzWALMatchesMaterialize
+  gates overlay reads == fully materialized document (clean after fixing root /
+  ancestor-prefix dirty detection found by the fuzzer).
+
+## 2026-11 round 10: breaking the dirty-read boundary — generation cache
+
+Round 9's remaining boundary: every read of an overlay-dirtied subtree
+materialized the whole document (O(document) per read). Round 10 breaks it with
+a **generation-keyed materialization cache**: WALStore tracks a `gen` counter
+bumped on every append/compact; `materialize` caches its result against `gen`
+and reuses it while the edit set is unchanged. Repeated dirty-subtree reads go
+from O(document) to O(1); the cost is paid once per edit-set change, not per read.
+
+**Measured (5000-record doc, one edit dirties the items subtree, read a field
+inside it), same-binary A/B:**
+
+| Read method | time | allocs |
+| --- | --- | --- |
+| Fresh materialize every read (round 9 behavior) | ~1.15 ms | 934 KB |
+| **Cached repeated read (round 10)** | **~93 ns** | **24 B** |
+
+**~12,000× faster, ~39,000× less memory** for the read-after-write pattern.
+Cache invalidation is exact: any append or compact bumps `gen`, forcing a
+rebuild on the next dirty read (TestWALMaterializeCacheInvalidation). The cache
+is guarded by its own mutex so reads build it without blocking writers; the
+returned slice is shared read-only. Race detector + FuzzWALMatchesMaterialize
+clean.
+
+**Remaining honest boundary (as of round 10; broken in round 11):** the FIRST
+dirty read after each edit still materialized O(document). → Round 11 replaces
+full-document materialization with subtree-local resolution.
+
+## 2026-11 round 11: subtree-local resolution — the last boundary broken
+
+Round 10's remaining boundary: the first dirty read after an edit materialized
+the WHOLE document. Round 11 breaks it with **subtree-local resolution**
+(`resolveSubtree`): a dirty read touches only the requested subtree plus the
+edits inside it — never the rest of the document.
+
+Mechanism:
+- Find the nearest ancestor overlay edit (its value replaces the subtree root)
+  or locate the base subtree via the **structural index** (`seekIndexed`, not a
+  stateless byte scan) and take a zero-copy slice of just that subtree.
+- Collect only descendant edits under the read path, strip the prefix to make
+  them relative, and apply them to the subtree slice with PatchSet/PatchDelete.
+- Exact-path hits and unaffected subtrees still take the zero-parse fast path.
+
+**Measured: FIRST dirty read (cache cold) of an element inside a large edited
+array, same-binary A/B:**
+
+| doc size | old full-materialize | new subtree-local |
+| --- | --- | --- |
+| 100 records | 7.3 µs / 18 KB | 1.1 µs / 1.4 KB |
+| 5 000 records | 1.16 ms / 934 KB | 2.2 µs / 1.4 KB |
+| 50 000 records | **103.7 ms / 9.46 MB** | **11 µs / 1.4 KB** |
+
+At 50 000 records: **~9,400× faster, ~6,700× less memory.** The old path's
+allocation grew linearly with the document (18 KB → 934 KB → 9.46 MB); the new
+path is **flat at ~1.4 KB regardless of document size** — both time and memory
+now scale with the *subtree*, not the document. The first-dirty-read
+O(document) boundary is broken.
+
+**Remaining honest note:** the residual time growth (1.1 → 11 µs across
+100 → 50 000) was structural-index navigation to locate the element, not copying;
+allocation is flat. A read of the ENTIRE dirty document (root) still assembles
+the whole thing — unavoidable, since the result IS the whole document. The
+breakthrough is that reading a *part* no longer pays for the *whole*.
+FuzzWALMatchesMaterialize clean (fixed root-read descendant collection found by
+the fuzzer); full matrix + race green.
+
+## 2026-11 round 12: indexed write validation — the residual O(n) eliminated
+
+Round 11 left a residual: writes to a deep array path still grew O(n) because
+`checkApplicable` validated via the **stateless** `planSet`/`findIndex`, which
+walks the array byte-by-byte from the start. (The round-11 read benchmark's
+time growth was actually this write-side cost, since it did a Set each iter.)
+
+Round 12 rewrites `checkApplicable`'s fast path to use the **structural index**:
+- full path resolves via `seekIndexed` (indexed array strides) → replace, OK;
+- else find the deepest existing ancestor by walking path prefixes through the
+  index, require it to be an object, and validate only the to-be-created tail
+  (object keys only; arrays not extended, scalars not descended).
+
+**Measured: write to a deep array element (`items[n/2].ok`), same-binary A/B:**
+
+| array size | before (stateless validate) | after (indexed validate) |
+| --- | --- | --- |
+| 100 | 314 ns | 370 ns |
+| 5 000 | 1.24 µs | 337 ns |
+| 50 000 | 9.63 µs | **408 ns** |
+
+Write cost is now **flat (~340–410 ns) regardless of array size**. And the
+first-dirty-read cycle (Set + read parent) is now flat too: 100→1.09 µs,
+5 000→1.11 µs, 50 000→1.15 µs (was 11 µs at 50 000). Both read and write scale
+with the subtree/edit, never the document.
+
+Correctness: the indexed validator matches `Set`'s accept/reject decisions,
+including nested creation under array elements and scalar-root rejection
+(TestWALApplicabilityNested + FuzzWALMatchesMaterialize, which caught a
+scalar-root edge). Full matrix + race green.
+
+**Remaining honest note:** reading the entire dirty root still assembles the
+whole document — logically unavoidable (the result IS the whole document).
+Every *partial* read and every write is now document-size-independent.
+
 ## Discipline about the numbers
 
 Every performance change in this repo follows the same process: **profile to find

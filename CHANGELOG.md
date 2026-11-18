@@ -7,6 +7,60 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **Persistent structural index — zero-parse data substrate**: `Document.Persist`,
+  `Open`, `View`, `ViewTrusted`, `VerifyIndex`, `IndexSize`. The pointer-free
+  index is sealed to disk once and re-opened by any process with no re-scan;
+  the canonical mmap pattern (verify once, then `ViewTrusted`) opens in ~126 ns
+  / 128 B vs ~19.5 µs / 109 KB to rebuild (~155× / ~850×). Cross-process demo
+  sustains 100k opens+queries at ~229 ns. Payload bound by a word-parallel
+  64-bit hash (~6.7 GB/s); zero-copy reinterpretation in the default build,
+  safe decode under `jseeksafe`. Every index offset is bounds-checked.
+- **Self-contained sealed stores**: `Seal`, `OpenSealed`, `ViewSealed`,
+  `ViewSealedTrusted`, `VerifySealed` pack payload+index into one portable file.
+- **mmap store handle**: `OpenStore` / `Store.View` / `Store.Close` — read-only
+  mapping, verified once, concurrent-safe O(1) views (unix mmap; other
+  platforms fall back to a one-time read).
+- **CLI store modes**: `jseek -seal in.json out.jstore` and
+  `jseek -open out.jstore 'path'` expose the substrate from the terminal.
+- **FuzzPersistRoundTrip**: persist→open round-trip + corrupt-rejection fuzz.
+- **NDJSON random-access store**: `SealNDJSON`, `OpenNDJSONStore`,
+  `NDJSONStore.Record`/`RecordInto`/`Raw`/`Each`/`Len`/`Close`, `AppendNDJSON`.
+  Per-record offset table + sealed indexes give O(1) record jumps (~45 ns vs
+  ~69 µs sequential, ~1500×) and incremental append. CLI: `-seal-n` / `-open-n
+  -at N` / `-append-n`. Guarded by `FuzzNDJSONStoreRoundTrip`.
+- **Zero-allocation reuse**: `ViewInto` re-points an existing Document for
+  alloc-free hot loops.
+- **Incremental index patch (single-document write path)**: `PatchSet` /
+  `PatchDelete` update a Document's index without a full re-scan (prefix kept,
+  suffix shifted, edit region re-scanned). `Store.Set` / `Store.Delete` expose
+  field-level writes on a sealed store. Guarded by `FuzzPatchMatchesRebuild`
+  (5.5M execs). Honest note: modest speed gain (~0–17%) because the payload copy
+  dominates; the value is enabling writes + ~45% less index memory on front
+  edits, not a dramatic speedup.
+- **WAL overlay store — genuinely cheap writes**: `WALStore` (`OpenWAL`/`NewWAL`,
+  `Set`/`Delete`/`Get`/`Exists`/typed getters, `Pending`/`Compact`/`Close`).
+  Append-only edit log over an immutable sealed base: a write is ~180 ns / ~300 B
+  vs ~82 µs / 344 KB for a full rewrite (~450×), and **independent of document
+  size** (100→50 000 records all ~160–186 ns). Optional WAL file for crash-safe
+  replay; `Compact` folds the log into a new base. CLI: `-wal` +
+  `-wset`/`-wdel`/`-wget`/`-wcompact`. Guarded by `FuzzWALMatchesMaterialize`.
+- **Generation-keyed materialization cache**: repeated reads of an
+  overlay-dirtied subtree are O(1) (~93 ns / 24 B); the cache rebuilds only when
+  the edit set changes (append/compact bumps a generation counter).
+- **Subtree-local resolution (breaks the first-dirty-read boundary)**: a dirty
+  read now touches only the requested subtree + edits inside it, never the whole
+  document. First dirty read of an element in a 50 000-record array: ~11 µs /
+  1.4 KB vs ~103.7 ms / 9.46 MB for full materialization (~9,400× / ~6,700×);
+  allocation is flat regardless of document size. Locates the base subtree via
+  the structural index; applies only descendant edits relative to it. Guarded by
+  `FuzzWALMatchesMaterialize`.
+- **Indexed write validation (eliminates residual O(n))**: `checkApplicable`
+  now validates edits via the structural index (`seekIndexed` + deepest-existing
+  -ancestor walk) instead of the stateless byte scanner. Writes to a deep array
+  element are flat (~340–410 ns) across 100→50 000 records (was 314 ns→9.6 µs);
+  the first-dirty-read cycle is flat too (~1.1 µs). Matches `Set`'s accept/reject
+  decisions incl. nested creation under array elements and scalar-root rejection
+  (`TestWALApplicabilityNested`).
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

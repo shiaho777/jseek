@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/shiaho777/jseek"
@@ -47,6 +48,17 @@ func main() {
 		validate = flag.Bool("v", false, "validate JSON; exit 0 if valid, 1 otherwise")
 		strict   = flag.Bool("strict", false, "with -v: also reject invalid UTF-8, lone surrogates, duplicate keys")
 		count    = flag.Bool("C", false, "print the count of array elements / object members at path")
+		seal     = flag.Bool("seal", false, "build a self-contained zero-parse store: jseek -seal in.json out.jstore")
+		open     = flag.Bool("open", false, "query a sealed store with zero re-parsing: jseek -open store.jstore 'path'")
+		sealN    = flag.Bool("seal-n", false, "build a random-access NDJSON store: jseek -seal-n in.ndjson out.njstore")
+		openN    = flag.Bool("open-n", false, "query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]")
+		appendN  = flag.Bool("append-n", false, "append records: jseek -append-n store.njstore new.ndjson")
+		at       = flag.Int("at", -1, "with -open-n: select a single record by index (0-based)")
+		wal      = flag.String("wal", "", "WAL log file for cheap writes (used with -wset/-wdel/-wget/-wcompact)")
+		wset     = flag.Bool("wset", false, "cheap write: jseek -wal log -wset store.jstore 'path' 'jsonValue'")
+		wdel     = flag.Bool("wdel", false, "cheap delete: jseek -wal log -wdel store.jstore 'path'")
+		wget     = flag.Bool("wget", false, "overlay-aware read: jseek -wal log -wget store.jstore 'path'")
+		wcompact = flag.Bool("wcompact", false, "fold WAL into a new base: jseek -wal log -wcompact store.jstore out.jstore")
 		showVer  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = usage
@@ -55,6 +67,26 @@ func main() {
 	if *showVer {
 		fmt.Println("jseek " + version)
 		return
+	}
+
+	// Store modes have their own argument shapes; handle before generic parsing.
+	if *seal {
+		os.Exit(runSeal(flag.Args()))
+	}
+	if *open {
+		os.Exit(runOpenStore(flag.Args(), *raw, *count))
+	}
+	if *sealN {
+		os.Exit(runSealNDJSON(flag.Args()))
+	}
+	if *openN {
+		os.Exit(runOpenNDJSON(flag.Args(), *raw, *count, *at))
+	}
+	if *wset || *wdel || *wget || *wcompact {
+		os.Exit(runWAL(flag.Args(), *wal, *wset, *wdel, *wget, *wcompact, *raw))
+	}
+	if *appendN {
+		os.Exit(runAppendNDJSON(flag.Args()))
 	}
 
 	args := flag.Args()
@@ -127,6 +159,17 @@ Flags:
   -v          validate JSON (exit 0 valid / 1 invalid)
   -strict     with -v: reject invalid UTF-8, lone surrogates, duplicate keys
   -C          print count at path instead of values
+  -seal       build a zero-parse store: jseek -seal in.json out.jstore
+  -open       query a store with no re-parsing: jseek -open out.jstore 'path'
+  -seal-n     build a random-access NDJSON store: jseek -seal-n in.ndjson out.njstore
+  -open-n     query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]
+  -append-n   append records: jseek -append-n store.njstore new.ndjson
+  -at N       with -open-n: select one record by index (0-based)
+  -wal FILE   WAL log for cheap writes (with -wset/-wdel/-wget/-wcompact)
+  -wset       cheap write: jseek -wal log -wset store.jstore 'path' 'jsonValue'
+  -wdel       cheap delete: jseek -wal log -wdel store.jstore 'path'
+  -wget       overlay read: jseek -wal log -wget store.jstore 'path'
+  -wcompact   fold WAL into new base: jseek -wal log -wcompact store.jstore out.jstore
   -version    print version
 
 Path syntax:
@@ -146,6 +189,8 @@ Examples:
   jseek 'users.#(active==true)#.email' api.json
   jseek -n -p 8 'latency_ms' logs.ndjson
   jseek -c big.json | jseek -v -strict
+  jseek -seal big.json big.jstore        # build once
+  jseek -open big.jstore 'users.#.name'  # query forever, zero re-parse
 `)
 }
 
@@ -170,6 +215,352 @@ func openInput(f string) (io.Reader, func(), error) {
 
 func readAll(r io.Reader) ([]byte, error) {
 	return io.ReadAll(r)
+}
+
+// runSeal builds a self-contained store: jseek -seal in.json out.jstore
+func runSeal(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "jseek: -seal needs <input.json> <output.jstore>")
+		return 2
+	}
+	data, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	if !jseek.Valid(data) {
+		fmt.Fprintln(os.Stderr, "jseek: input is not valid JSON")
+		return 1
+	}
+	out, err := os.Create(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	defer out.Close()
+	bw := bufio.NewWriter(out)
+	if err := jseek.Seal(bw, data); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if err := bw.Flush(); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	st, _ := out.Stat()
+	fmt.Fprintf(os.Stderr, "sealed %s -> %s (%d bytes payload, %d bytes store)\n",
+		args[0], args[1], len(data), st.Size())
+	return 0
+}
+
+// runOpenStore queries a sealed store with zero re-parsing:
+// jseek -open store.jstore 'path'   (no path = pretty-print payload)
+func runOpenStore(args []string, raw, count bool) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: -open needs <store.jstore> [path]")
+		return 2
+	}
+	s, err := jseek.OpenStore(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer s.Close()
+	path := ""
+	if len(args) > 1 {
+		path = args[1]
+	}
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	data := s.Data()
+	if path == "" || path == "." {
+		out, err := jseek.Indent(data, "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		w.Write(out)
+		w.WriteByte('\n')
+		return 0
+	}
+	d, err := s.View()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if count {
+		n, err := d.Count(jseek.ParseDotPath(path)...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintln(w, n)
+		return 0
+	}
+	results, err := jseek.QueryTyped(data, path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	for _, res := range results {
+		writeTyped(w, res, raw)
+	}
+	return 0
+}
+
+// runSealNDJSON: jseek -seal-n in.ndjson out.njstore
+func runSealNDJSON(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "jseek: -seal-n needs <input.ndjson> <output.njstore>")
+		return 2
+	}
+	in, err := os.Open(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	defer in.Close()
+	out, err := os.Create(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	defer out.Close()
+	bw := bufio.NewWriter(out)
+	n, err := jseek.SealNDJSON(bw, in)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if err := bw.Flush(); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	st, _ := out.Stat()
+	fmt.Fprintf(os.Stderr, "sealed %d records -> %s (%d bytes)\n", n, args[1], st.Size())
+	return 0
+}
+
+// runOpenNDJSON: jseek -open-n store.njstore 'path' [-at N]
+func runOpenNDJSON(args []string, raw, count bool, at int) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: -open-n needs <store.njstore> [path]")
+		return 2
+	}
+	// Extract a trailing "-at N" even when it follows positional args (Go's
+	// flag package stops parsing at the first non-flag argument).
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-at" && i+1 < len(args) {
+			if n, e := strconv.Atoi(args[i+1]); e == nil {
+				at = n
+			}
+			i++
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	args = rest
+	s, err := jseek.OpenNDJSONStore(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer s.Close()
+	path := ""
+	if len(args) > 1 {
+		path = args[1]
+	}
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	emit := func(d *jseek.Document, rawRec []byte) error {
+		if path == "" || path == "." {
+			out, err := jseek.Compact(rawRec)
+			if err != nil {
+				return err
+			}
+			w.Write(out)
+			w.WriteByte('\n')
+			return nil
+		}
+		if count {
+			n, err := d.Count(jseek.ParseDotPath(path)...)
+			if err != nil {
+				return nil
+			}
+			fmt.Fprintln(w, n)
+			return nil
+		}
+		results, err := jseek.QueryTyped(rawRec, path)
+		if err != nil {
+			return err
+		}
+		for _, res := range results {
+			writeTyped(w, res, raw)
+		}
+		return nil
+	}
+
+	if at >= 0 {
+		d, err := s.Record(at)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		rawRec, _ := s.Raw(at)
+		if err := emit(d, rawRec); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		return 0
+	}
+	var d jseek.Document
+	for i := 0; i < s.Len(); i++ {
+		if _, err := s.RecordInto(&d, i); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		rawRec, _ := s.Raw(i)
+		if err := emit(&d, rawRec); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+// runAppendNDJSON: jseek -append-n store.njstore new.ndjson
+func runAppendNDJSON(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "jseek: -append-n needs <store.njstore> <new.ndjson>")
+		return 2
+	}
+	prior, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	add, err := os.Open(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	defer add.Close()
+	tmp := args[0] + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	bw := bufio.NewWriter(out)
+	total, err := jseek.AppendNDJSON(bw, prior, add)
+	if err != nil {
+		out.Close()
+		os.Remove(tmp)
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if err := bw.Flush(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	out.Close()
+	if err := os.Rename(tmp, args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "appended -> %d total records\n", total)
+	return 0
+}
+
+// runWAL handles cheap-write modes over a sealed base + WAL log.
+//   -wset store.jstore 'path' 'jsonValue'
+//   -wdel store.jstore 'path'
+//   -wget store.jstore 'path'
+//   -wcompact store.jstore out.jstore
+func runWAL(args []string, walPath string, wset, wdel, wget, wcompact, raw bool) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: WAL modes need <store.jstore> ...")
+		return 2
+	}
+	w, err := jseek.OpenWAL(args[0], walPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer w.Close()
+	switch {
+	case wset:
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "jseek: -wset needs <store> <path> <jsonValue>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		if err := w.Set([]byte(args[2]), keys...); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "set %s (%d pending)\n", args[1], w.Pending())
+	case wdel:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wdel needs <store> <path>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		if err := w.Delete(keys...); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "deleted %s (%d pending)\n", args[1], w.Pending())
+	case wget:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wget needs <store> <path>")
+			return 2
+		}
+		keys := jseek.ParseDotPath(args[1])
+		v, vt, err := w.Get(keys...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		bw := bufio.NewWriter(os.Stdout)
+		writeTyped(bw, jseek.QueryResult{Raw: v, Type: vt}, raw)
+		bw.Flush()
+	case wcompact:
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "jseek: -wcompact needs <store> <out.jstore>")
+			return 2
+		}
+		if err := w.Compact(); err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		// After compact the base holds everything; write it out via a fresh
+		// seal of the compacted payload.
+		d, _, err := w.Get()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		out, err := os.Create(args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 2
+		}
+		bw := bufio.NewWriter(out)
+		if err := jseek.Seal(bw, d); err != nil {
+			out.Close()
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		bw.Flush()
+		out.Close()
+		fmt.Fprintf(os.Stderr, "compacted -> %s\n", args[1])
+	}
+	return 0
 }
 
 func runValidate(files []string, strict bool) int {

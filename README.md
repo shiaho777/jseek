@@ -69,6 +69,128 @@ the bytes each query needs. The gap widens with document size. See
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology and the library-level
 comparisons against gjson/jsonparser/sonic.
 
+## Beyond extraction: a zero-parse JSON data substrate
+
+jseek's structural index is a compact, pointer-free array — which means it can
+be **persisted once and re-opened by any process with zero re-parsing**. This
+turns jseek from a per-request extractor into an embeddable, shareable JSON
+storage layer: the "SQLite of JSON" for applications that store JSON and read
+fields from it repeatedly (config stores, document caches, IPC shared state,
+edge-device state, feature stores).
+
+```go
+// One self-contained file: payload + index, sealed once.
+jseek.Seal(file, data)                  // -> store.jstore
+
+// Any process: mmap it, verify once, then open in O(1) forever.
+s, _ := jseek.OpenStore("store.jstore") // maps read-only + verifies
+defer s.Close()
+doc, _ := s.View()                      // O(1), zero re-parse, zero-copy
+rps, _ := doc.GetInt("config", "limits", "rps")
+```
+
+Or from the terminal:
+
+```sh
+jseek -seal big.json big.jstore         # build once
+jseek -open big.jstore 'users.#.name'   # query forever, zero re-parse
+```
+
+**Measured** (Apple M4 Pro, 27 KB doc, open + deep query):
+
+| Path | time | allocs |
+| --- | --- | --- |
+| Rebuild index from bytes (every process today) | ~19.5 µs | 109 KB |
+| `View` (zero-copy + full hash & offset verify) | ~7.9 µs | 128 B |
+| `ViewTrusted` after one-time `VerifyIndex` | **~126 ns** | **128 B** |
+
+**~155× faster open, ~850× less memory** on the trusted path; even the
+fully-verified `View` is ~2.5× faster than rebuilding. The payload hash is a
+word-parallel mix running at **~6.7 GB/s** (vs ~0.3 GB/s for byte-wise FNV),
+and every index offset is bounds-checked, so a corrupt or stale image is
+rejected (`ErrBadIndex`) — never an out-of-bounds read. A cross-process demo
+sustains **100 000 opens + 2-field queries at ~229 ns each**.
+
+APIs:
+- **Self-contained stores**: `Seal`, `OpenSealed`, `ViewSealed` /
+  `ViewSealedTrusted`, `VerifySealed`, and `OpenStore` / `Store.View` /
+  `Store.Close` (mmap-backed, concurrent-safe, read-only).
+- **Split index + payload**: `Document.Persist`, `Open`, `View` /
+  `ViewTrusted`, `VerifyIndex`, `Document.IndexSize`.
+- **Zero-allocation reuse**: `ViewInto(d, idx, data)` re-points an existing
+  Document — a hot loop that opens repeatedly allocates **nothing**.
+- **Field-level writes**: `PatchSet` / `PatchDelete` update a Document's index
+  incrementally (no full re-scan); `Store.Set` / `Store.Delete` return a new
+  sealed image with the edit applied. Stores stay immutable — write the new
+  image and re-open. (The payload copy dominates cost, so this enables writes
+  more than it accelerates them; see BENCHMARKS.md.)
+
+### Genuinely cheap writes: the WAL overlay
+
+An in-place edit must copy the whole contiguous payload. `WALStore` sidesteps
+that with a **log-structured overlay** (the SQLite-WAL / LSM idea): an immutable
+sealed base plus an append-only edit log. A write appends one small record —
+**no payload copy, no index rebuild** — so it costs the same whether the
+document is 1 KB or 1 GB:
+
+```go
+w, _ := jseek.OpenWAL("base.jstore", "edits.wal") // wal optional ("" = in-memory)
+defer w.Close()
+w.Set([]byte(`42`), "cfg", "version")   // ~180 ns, ~300 B — O(edit), not O(doc)
+v, _ := w.GetInt("cfg", "version")      // overlay-aware read
+w.Compact()                              // fold log into a fresh base (batched)
+```
+
+```sh
+jseek -wal edits.wal -wset base.jstore 'cfg.version' '42'
+jseek -wal edits.wal -wget base.jstore 'cfg.version'
+jseek -wal edits.wal -wcompact base.jstore new.jstore
+```
+
+**Measured** (5000-record ~330 KB doc): WAL write **~180 ns / ~300 B** vs a full
+rewrite **~82 µs / 344 KB** (~450×). Writes are validated via the structural
+index, so a write to a deep array element is **flat (~340–410 ns) across
+100→50 000 records** — no O(n) byte scan. Exact-path and unaffected reads stay
+zero-parse. Dirty reads use **subtree-local resolution**: only the requested
+subtree + edits inside it are touched, never the whole document — a first dirty
+read of an element in a 50 000-record array is **~1.1 µs / 1.5 KB** vs ~103.7 ms /
+9.46 MB to materialize everything, with time and allocation flat regardless of
+document size. Repeated dirty reads hit a **generation-keyed cache** (~93 ns /
+24 B). Compaction is the one O(document) step, amortized over many writes.
+Optional WAL file gives crash-safe replay. Guarded by `FuzzWALMatchesMaterialize`.
+
+### NDJSON random-access store
+
+Logs, events, and metrics are the largest large-JSON shape, and a plain
+`.ndjson` file can only be scanned sequentially. `SealNDJSON` builds a
+per-record offset table plus a sealed index per record, so **record N is
+reachable in O(1)** and queryable with zero re-parsing:
+
+```go
+jseek.SealNDJSON(out, ndjsonReader)     // build once
+s, _ := jseek.OpenNDJSONStore("logs.njstore")
+defer s.Close()
+d, _ := s.Record(999999)                // O(1) jump, zero re-parse
+lat, _ := d.GetInt("latency_ms")
+s.Each(func(i int, d *jseek.Document) bool { /* zero-alloc scan */ ; return true })
+```
+
+```sh
+jseek -seal-n logs.ndjson logs.njstore
+jseek -open-n logs.njstore 'latency_ms' -at 999999   # one record, instant
+jseek -append-n logs.njstore new.ndjson              # incremental append
+```
+
+**Measured** (5000 records, jump to record 4999 + field read): **~45 ns / 0
+allocs** via the store vs **~69 µs** for a sequential scan that must walk every
+prior record — **~1500×**. `AppendNDJSON` copies prior records verbatim and
+indexes only the new ones (O(new records)). Guarded by
+`FuzzNDJSONStoreRoundTrip`.
+
+The zero-copy view reinterprets the index arrays in place (default build);
+`-tags jseeksafe` decodes them safely instead. mmap is used on unix; other
+platforms fall back to a one-time read. The format is experimental (pre-1.0).
+
 ## State of the art for lazy JSON extraction
 
 JSON libraries fall into two camps:
