@@ -247,19 +247,129 @@ func (w *WALStore) Get(keys ...string) ([]byte, ValueType, error) {
 		return v, vt, err
 	}
 	if subtreeDirty {
-		// Materialize base + overlay, then read the (possibly partial) subtree.
-		doc, err := w.materialize()
-		if err != nil {
-			return nil, NotExist, err
-		}
-		v, vt, _, err := Get(doc, keys...)
-		return v, vt, err
+		// Subtree-local resolution: touch only the requested subtree and the
+		// edits inside it — never the whole document. This breaks the
+		// "first dirty read is O(document)" boundary.
+		return w.resolveSubtree(keys)
 	}
 	d, err := base.View()
 	if err != nil {
 		return nil, NotExist, err
 	}
 	v, vt, _, err := d.Get(keys...)
+	return v, vt, err
+}
+
+// resolveSubtree reads keys by combining the nearest ancestor source (an
+// ancestor overlay edit's value, or the base subtree) with only the descendant
+// edits that fall inside the requested subtree. Cost is O(subtree size +
+// edits-in-subtree), independent of the rest of the document.
+func (w *WALStore) resolveSubtree(keys []string) ([]byte, ValueType, error) {
+	key := walPathKey(keys)
+	sep := string(rune(0x1f))
+	w.mu.RLock()
+	// Find the nearest ancestor edit (proper prefix of key) and collect
+	// descendant edits (key is a proper prefix of them), plus an exact hit.
+	ancestorPath := ""
+	ancestorIdx := -1
+	var desc []walEdit
+	var exactEdit *walEdit
+	for p, i := range w.latest {
+		e := w.edits[i]
+		switch {
+		case p == key:
+			ee := e
+			exactEdit = &ee
+		case key != "" && strings.HasPrefix(key, p+sep):
+			// p is a proper ancestor of key; keep the longest (nearest).
+			if len(p) > len(ancestorPath) {
+				ancestorPath = p
+				ancestorIdx = i
+			}
+		case key == "" || strings.HasPrefix(p, key+sep):
+			// p is a proper descendant of key (or key is the root, so every
+			// edit is a descendant).
+			desc = append(desc, e)
+		}
+	}
+	base := w.base
+	w.mu.RUnlock()
+
+	// Determine the source bytes for the subtree rooted at `keys` and the
+	// relative path from that source to `keys`. An exact edit at `keys`
+	// replaces the whole subtree and takes precedence over base/ancestor.
+	var src []byte
+	var relKeys []string
+	switch {
+	case exactEdit != nil:
+		if exactEdit.op == walDelete {
+			return nil, NotExist, ErrKeyPathNotFound
+		}
+		src = exactEdit.val
+		relKeys = nil
+	case ancestorIdx >= 0:
+		ae := w.edits[ancestorIdx]
+		if ae.op == walDelete {
+			return nil, NotExist, ErrKeyPathNotFound
+		}
+		src = ae.val
+		relKeys = keys[len(splitWALPath(ancestorPath)):]
+	default:
+		bd := base.Data()
+		// Locate the subtree via the structural index (O(index navigation)),
+		// not a stateless byte scan — so locating a deep element does not cost
+		// O(array length).
+		d, err := base.View()
+		if err != nil {
+			return nil, NotExist, err
+		}
+		start, ok := d.seekIndexed(keys)
+		if !ok {
+			return nil, NotExist, ErrKeyPathNotFound
+		}
+		vs, ve, vt, vok := valueBounds(bd, start)
+		if !vok {
+			return nil, NotExist, ErrMalformedJSON
+		}
+		if vt == String {
+			ve++ // include closing quote for a self-contained token
+			vs-- // include opening quote
+		}
+		src = bd[vs:ve]
+		relKeys = nil
+	}
+
+	// If there are no descendant edits, the source already answers the read.
+	if len(desc) == 0 {
+		v, vt, _, err := Get(src, relKeys...)
+		return v, vt, err
+	}
+
+	// Apply descendant edits relative to the source root. Sort by path depth
+	// (shallow first) so ancestor edits land before deeper ones; PatchSet
+	// handles ordering, but shallow-first avoids creating then overwriting.
+	sort.Slice(desc, func(i, j int) bool {
+		return strings.Count(desc[i].path, sep) < strings.Count(desc[j].path, sep)
+	})
+	cur := append([]byte(nil), src...)
+	cd := Index(cur)
+	// The source root corresponds to `keys` (or an ancestor). Descendant edit
+	// paths are absolute; strip the prefix up to the source root.
+	rootDepth := len(keys) - len(relKeys)
+	for _, e := range desc {
+		abs := splitWALPath(e.path)
+		rel := abs[rootDepth:]
+		var err error
+		if e.op == walDelete {
+			cur, cd, _, err = PatchDelete(cd, cur, rel...)
+		} else {
+			cur, cd, err = PatchSet(cd, cur, e.val, rel...)
+		}
+		if err != nil {
+			return nil, NotExist, err
+		}
+	}
+	v, vt, _, err := Get(cur, relKeys...)
 	return v, vt, err
 }
 

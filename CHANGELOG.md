@@ -44,12 +44,16 @@ tagged releases begin.
   size** (100→50 000 records all ~160–186 ns). Optional WAL file for crash-safe
   replay; `Compact` folds the log into a new base. CLI: `-wal` +
   `-wset`/`-wdel`/`-wget`/`-wcompact`. Guarded by `FuzzWALMatchesMaterialize`.
-- **Generation-keyed materialization cache (breaks the dirty-read boundary)**:
-  repeated reads of an overlay-dirtied subtree are now O(1) (~93 ns / 24 B) vs
-  O(document) per read before (~1.15 ms / 934 KB) — ~12,000× for read-after-write
-  patterns. The cache rebuilds only when the edit set changes (append/compact
-  bumps a generation counter). First dirty read after an edit still materializes;
-  truly incremental subtree materialization is deferred.
+- **Generation-keyed materialization cache**: repeated reads of an
+  overlay-dirtied subtree are O(1) (~93 ns / 24 B); the cache rebuilds only when
+  the edit set changes (append/compact bumps a generation counter).
+- **Subtree-local resolution (breaks the first-dirty-read boundary)**: a dirty
+  read now touches only the requested subtree + edits inside it, never the whole
+  document. First dirty read of an element in a 50 000-record array: ~11 µs /
+  1.4 KB vs ~103.7 ms / 9.46 MB for full materialization (~9,400× / ~6,700×);
+  allocation is flat regardless of document size. Locates the base subtree via
+  the structural index; applies only descendant edits relative to it. Guarded by
+  `FuzzWALMatchesMaterialize`.
 - **Advanced query syntax**: recursive descent `..key`, array slices
   `[start:end]` (negative bounds from end), compound filters `#(a && b || c)#`
   with `&&`-over-`||` precedence. Output verified byte-identical to jq;

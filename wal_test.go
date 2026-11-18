@@ -314,6 +314,54 @@ func BenchmarkWALDirtyRead(b *testing.B) {
 	})
 }
 
+// BenchmarkWALSubtreeFirstRead measures the FIRST dirty read (cache cold) of a
+// small field inside a large edited array. With subtree-local resolution it
+// should be ~constant regardless of array size; the old full-materialize path
+// grew with the document. This is the boundary-breaking measurement.
+func BenchmarkWALSubtreeFirstRead(b *testing.B) {
+	for _, n := range []int{100, 5000, 50000} {
+		var sb strings.Builder
+		sb.WriteString(`{"items":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`{"id":`)
+			sb.WriteString(itoa(i))
+			sb.WriteString(`,"desc":"a long description string number `)
+			sb.WriteString(itoa(i))
+			sb.WriteString(`","ok":true}`)
+		}
+		sb.WriteString(`]}`)
+		data := []byte(sb.String())
+		dir := b.TempDir()
+		bp := filepath.Join(dir, "b.jstore")
+		fh, _ := os.Create(bp)
+		Seal(fh, data)
+		fh.Close()
+		w, err := OpenWAL(bp, "")
+		if err != nil {
+			b.Fatal(err)
+		}
+		// One edit deep in the array dirties the items subtree.
+		w.Set([]byte(`false`), "items", "["+itoa(n/2)+"]", "ok")
+		b.Run("Local_"+itoa(n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				// Bump gen (cache cold), then read the ELEMENT (parent of the
+				// edited field) so descendant edits force subtree assembly.
+				w.Set([]byte(`false`), "items", "["+itoa(n/2)+"]", "ok")
+				v, _, err := w.Get("items", "["+itoa(n/2)+"]")
+				if err != nil {
+					b.Fatal(err)
+				}
+				_ = v
+			}
+		})
+		w.Close()
+	}
+}
+
 // BenchmarkWALWrite is the breakthrough measurement: a cheap overlay write vs
 // a full payload-rewriting Set on a large document.
 func BenchmarkWALWrite(b *testing.B) {

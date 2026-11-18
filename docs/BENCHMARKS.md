@@ -594,12 +594,47 @@ is guarded by its own mutex so reads build it without blocking writers; the
 returned slice is shared read-only. Race detector + FuzzWALMatchesMaterialize
 clean.
 
-**Remaining honest boundary:** the FIRST dirty read after each edit still
-materializes O(document), and a write-then-read-every-time workload rebuilds
-each time. The cache wins decisively for read-heavy / batched-read patterns
-(the common case); a truly incremental materialization (recompute only the
-edited subtree, not the whole doc) is the next step and is deferred — it needs
-subtree-splice surgery rather than full-document PatchSet.
+**Remaining honest boundary (as of round 10; broken in round 11):** the FIRST
+dirty read after each edit still materialized O(document). → Round 11 replaces
+full-document materialization with subtree-local resolution.
+
+## 2026-11 round 11: subtree-local resolution — the last boundary broken
+
+Round 10's remaining boundary: the first dirty read after an edit materialized
+the WHOLE document. Round 11 breaks it with **subtree-local resolution**
+(`resolveSubtree`): a dirty read touches only the requested subtree plus the
+edits inside it — never the rest of the document.
+
+Mechanism:
+- Find the nearest ancestor overlay edit (its value replaces the subtree root)
+  or locate the base subtree via the **structural index** (`seekIndexed`, not a
+  stateless byte scan) and take a zero-copy slice of just that subtree.
+- Collect only descendant edits under the read path, strip the prefix to make
+  them relative, and apply them to the subtree slice with PatchSet/PatchDelete.
+- Exact-path hits and unaffected subtrees still take the zero-parse fast path.
+
+**Measured: FIRST dirty read (cache cold) of an element inside a large edited
+array, same-binary A/B:**
+
+| doc size | old full-materialize | new subtree-local |
+| --- | --- | --- |
+| 100 records | 7.3 µs / 18 KB | 1.1 µs / 1.4 KB |
+| 5 000 records | 1.16 ms / 934 KB | 2.2 µs / 1.4 KB |
+| 50 000 records | **103.7 ms / 9.46 MB** | **11 µs / 1.4 KB** |
+
+At 50 000 records: **~9,400× faster, ~6,700× less memory.** The old path's
+allocation grew linearly with the document (18 KB → 934 KB → 9.46 MB); the new
+path is **flat at ~1.4 KB regardless of document size** — both time and memory
+now scale with the *subtree*, not the document. The first-dirty-read
+O(document) boundary is broken.
+
+**Remaining honest note:** the residual time growth (1.1 → 11 µs across
+100 → 50 000) is structural-index navigation to locate the element, not copying;
+allocation is flat. A read of the ENTIRE dirty document (root) still assembles
+the whole thing — unavoidable, since the result IS the whole document. The
+breakthrough is that reading a *part* no longer pays for the *whole*.
+FuzzWALMatchesMaterialize clean (fixed root-read descendant collection found by
+the fuzzer); full matrix + race green.
 
 ## Discipline about the numbers
 
