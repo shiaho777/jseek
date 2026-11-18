@@ -7,6 +7,25 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **NDJSON query engine** (`ndjson_query.go`): record-level WHERE filtering,
+  projection, and aggregation (count/sum/avg/min/max + group-by) over the
+  zero-parse random-access store — `SELECT fields FROM records WHERE cond
+  GROUP BY key`. `ParseWhere` parses a predictable comparison conjunction
+  (`latency_ms > 100 && status == "error"`); predicates precompute the literal
+  type/decoded value and reuse decode buffers, so filtering and aggregation are
+  **zero-allocation per record**. On 100k records (Apple M4 Pro): CountWhere
+  ~5 ms / 0 allocs, Aggregate ~6.3 ms, GroupAggregate ~9.8 ms / 11 allocs
+  (group-count-bound, not record-bound). CLI: `jseek -q store.njstore
+  [-where cond] [-select f1,f2] [-agg field] [-group key] [-limit N]`.
+  Differential-fuzzed against an `encoding/json` reference.
+- **Crash-safe durability** (`durable.go`, WAL v2): `WriteFileAtomic` /
+  `SealFileAtomic` (temp + fsync + rename + dir-fsync) guarantee no torn file;
+  WAL records now carry a CRC32 checksum and appends are fsynced, so a confirmed
+  write survives power loss; replay detects and truncates torn/corrupt tails;
+  `Compact` persists the folded base atomically **before** clearing the log,
+  closing the crash window that previously lost committed edits (replay over a
+  compacted base is idempotent). Proven by crash-injection tests (torn tail,
+  flipped-byte CRC, compact-before-truncate).
 - **gjson drop-in compatibility layer** (`gjsoncompat`): one-line import swap
   (`import gjson "github.com/shiaho777/jseek/gjsoncompat"`) preserves the common
   gjson read API — `Get`/`GetBytes`/`Parse`/`GetMany`/`GetManyBytes`/`Valid` and

@@ -28,8 +28,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/shiaho777/jseek"
@@ -54,6 +57,12 @@ func main() {
 		openN    = flag.Bool("open-n", false, "query an NDJSON store: jseek -open-n out.njstore 'path' [-at N]")
 		appendN  = flag.Bool("append-n", false, "append records: jseek -append-n store.njstore new.ndjson")
 		at       = flag.Int("at", -1, "with -open-n: select a single record by index (0-based)")
+		query    = flag.Bool("q", false, "query an NDJSON store: jseek -q store.njstore [-where cond] [-select f1,f2] [-agg field] [-group key] [-limit N]")
+		where    = flag.String("where", "", "with -q: filter, e.g. 'latency_ms > 100 && status == \"error\"'")
+		sel      = flag.String("select", "", "with -q: comma-separated projection fields (default: whole record)")
+		agg      = flag.String("agg", "", "with -q: aggregate a numeric field (count/sum/avg/min/max)")
+		group    = flag.String("group", "", "with -q and -agg: group by this field")
+		limit    = flag.Int("limit", 0, "with -q: max records to emit (0 = unlimited)")
 		wal      = flag.String("wal", "", "WAL log file for cheap writes (used with -wset/-wdel/-wget/-wcompact)")
 		wset     = flag.Bool("wset", false, "cheap write: jseek -wal log -wset store.jstore 'path' 'jsonValue'")
 		wdel     = flag.Bool("wdel", false, "cheap delete: jseek -wal log -wdel store.jstore 'path'")
@@ -87,6 +96,9 @@ func main() {
 	}
 	if *appendN {
 		os.Exit(runAppendNDJSON(flag.Args()))
+	}
+	if *query {
+		os.Exit(runQueryNDJSON(flag.Args(), *where, *sel, *agg, *group, *limit, *raw))
 	}
 
 	args := flag.Args()
@@ -430,6 +442,139 @@ func runOpenNDJSON(args []string, raw, count bool, at int) int {
 	return 0
 }
 
+// runQueryNDJSON: jseek -q store.njstore [-where cond] [-select f1,f2]
+//
+//	[-agg field] [-group key] [-limit N]
+//
+// Runs filter/projection/aggregation on the zero-parse NDJSON substrate.
+func runQueryNDJSON(args []string, where, sel, agg, group string, limit int, raw bool) int {
+	// Go's flag package stops at the first positional arg, so flags placed after
+	// the store path are extracted manually here (same approach as -at).
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		take := func() string {
+			if i+1 < len(args) {
+				i++
+				return args[i]
+			}
+			return ""
+		}
+		switch a {
+		case "-where":
+			where = take()
+		case "-select":
+			sel = take()
+		case "-agg":
+			agg = take()
+		case "-group":
+			group = take()
+		case "-limit":
+			if n, e := strconv.Atoi(take()); e == nil {
+				limit = n
+			}
+		case "-r":
+			raw = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	args = rest
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "jseek: -q needs <store.njstore>")
+		return 2
+	}
+	s, err := jseek.OpenNDJSONStore(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	defer s.Close()
+
+	w, err := jseek.ParseWhere(where)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek: bad -where:", err)
+		return 2
+	}
+	var fields []string
+	if sel != "" {
+		for _, f := range strings.Split(sel, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fields = append(fields, f)
+			}
+		}
+	}
+
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+
+	// Aggregation mode.
+	if agg != "" {
+		if group != "" {
+			g, err := s.GroupAggregate(w, group, agg)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "jseek:", err)
+				return 1
+			}
+			keys := make([]string, 0, len(g))
+			for k := range g {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				a := g[k]
+				fmt.Fprintf(out, "%s\tcount=%d\tn=%d\tsum=%s\tavg=%s\tmin=%s\tmax=%s\n",
+					k, a.Count, a.N, fmtNum(a.Sum), fmtNum(a.Avg()), fmtNum(a.Min), fmtNum(a.Max))
+			}
+			return 0
+		}
+		a, err := s.Aggregate(w, agg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "jseek:", err)
+			return 1
+		}
+		fmt.Fprintf(out, "count=%d\tn=%d\tsum=%s\tavg=%s\tmin=%s\tmax=%s\n",
+			a.Count, a.N, fmtNum(a.Sum), fmtNum(a.Avg()), fmtNum(a.Min), fmtNum(a.Max))
+		return 0
+	}
+
+	// Count-only mode: -q with -where but no -select/-agg and a -C-like intent is
+	// expressed via -select "" plus -limit; here plain -q emits records.
+	data, err := s.SelectJSON(w, fields, limit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "jseek:", err)
+		return 1
+	}
+	if raw {
+		// Raw mode strips quotes from single-string projections line by line.
+		for _, line := range bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n")) {
+			if len(line) >= 2 && line[0] == '"' && line[len(line)-1] == '"' {
+				out.Write(line[1 : len(line)-1])
+			} else {
+				out.Write(line)
+			}
+			out.WriteByte('\n')
+		}
+		return 0
+	}
+	out.Write(data)
+	return 0
+}
+
+func fmtNum(f float64) string {
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if math.IsInf(f, 1) {
+		return "+Inf"
+	}
+	if math.IsInf(f, -1) {
+		return "-Inf"
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
 // runAppendNDJSON: jseek -append-n store.njstore new.ndjson
 func runAppendNDJSON(args []string) int {
 	if len(args) != 2 {
@@ -477,10 +622,11 @@ func runAppendNDJSON(args []string) int {
 }
 
 // runWAL handles cheap-write modes over a sealed base + WAL log.
-//   -wset store.jstore 'path' 'jsonValue'
-//   -wdel store.jstore 'path'
-//   -wget store.jstore 'path'
-//   -wcompact store.jstore out.jstore
+//
+//	-wset store.jstore 'path' 'jsonValue'
+//	-wdel store.jstore 'path'
+//	-wget store.jstore 'path'
+//	-wcompact store.jstore out.jstore
 func runWAL(args []string, walPath string, wset, wdel, wget, wcompact, raw bool) int {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "jseek: WAL modes need <store.jstore> ...")

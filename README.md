@@ -202,6 +202,44 @@ The zero-copy view reinterprets the index arrays in place (default build);
 `-tags jseeksafe` decodes them safely instead. mmap is used on unix; other
 platforms fall back to a one-time read. The format is experimental (pre-1.0).
 
+### Query engine: SQL-like analytics over JSON logs
+
+The store is not just random-access — it is queryable. Filter, project, and
+aggregate records without re-parsing any of them:
+
+```go
+s, _ := jseek.OpenNDJSONStore("logs.njstore")
+w, _ := jseek.ParseWhere(`latency_ms > 100 && status == "error"`)
+n, _ := s.Count(w)                          // matching records
+a, _ := s.Aggregate(w, "latency_ms")        // count/sum/avg/min/max
+g, _ := s.GroupAggregate(nil, "region", "latency_ms") // per-region stats
+out, _ := s.SelectJSON(w, []string{"id", "latency_ms"}, 10) // projected NDJSON
+```
+
+```sh
+jseek -q logs.njstore -where 'latency_ms > 100 && status == "error"' \
+      -select id,latency_ms -limit 10
+jseek -q logs.njstore -where 'status == "error"' -agg latency_ms
+jseek -q logs.njstore -agg latency_ms -group region
+```
+
+**Measured** (100 000 records, Apple M4 Pro): filtered count ~5 ms / **0 allocs**,
+aggregation ~6.3 ms, group-by ~9.8 ms / 11 allocs (group-count-bound). A full
+filtered aggregation over 100 k log records runs in ~10 ms wall time end-to-end.
+Predicates precompute the literal and reuse decode buffers, so the scan never
+allocates per record. Differential-fuzzed against `encoding/json`. This is a
+single-pass zero-parse scan, not an indexed planner — a field index that skips
+non-matching records is future work.
+
+### Crash-safe writes
+
+The WAL is durable: records carry a CRC32 checksum, appends fsync before
+returning, replay truncates torn/corrupt tails, and `Compact` persists the folded
+base atomically *before* clearing the log — so a crash never loses a confirmed
+write. `WriteFileAtomic`/`SealFileAtomic` give every file replacement no-torn
+semantics. Proven by crash-injection tests (torn tail, flipped-byte CRC,
+compact-before-truncate idempotent recovery).
+
 ## State of the art for lazy JSON extraction
 
 JSON libraries fall into two camps:
