@@ -7,6 +7,22 @@ tagged releases begin.
 ## [Unreleased]
 
 ### Added
+- **gjson drop-in compatibility layer** (`gjsoncompat`): one-line import swap
+  (`import gjson "github.com/shiaho777/jseek/gjsoncompat"`) preserves the common
+  gjson read API — `Get`/`GetBytes`/`Parse`/`GetMany`/`GetManyBytes`/`Valid` and
+  the `Result` accessors — backed by jseek's lazy engine. `Result.Type` numbering
+  matches gjson exactly; terminal `#` counts, numeric object keys, and lenient
+  number overflow (`1e1000`→`+Inf`) are bridged. Differential-tested against real
+  gjson (`FuzzGjsonCompatSinglePath`, 8.5M+ execs, zero divergence). Modifiers
+  and gjson-specific filter syntax are out of scope and return not-found rather
+  than panicking. See `docs/MIGRATION.md`.
+- **Zero-install browser playground** (`playground/`): the same engine compiled
+  to WebAssembly (`query`/`valid`/`count`/`bench`), runs entirely locally — no
+  data leaves the page. Rebuild with `scripts/build-playground.sh`.
+- **Reproducible benchmark script** (`scripts/reproducible-bench.sh`): one command
+  reproduces every headline number — library A/B vs gjson/jsonparser/sonic/
+  simdjson-go, index/tape/transpose, zero-parse open, WAL cheap writes, NDJSON
+  random access, and CLI vs jq on real generated files.
 - **Persistent structural index — zero-parse data substrate**: `Document.Persist`,
   `Open`, `View`, `ViewTrusted`, `VerifyIndex`, `IndexSize`. The pointer-free
   index is sealed to disk once and re-opened by any process with no re-scan;
